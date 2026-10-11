@@ -1,0 +1,154 @@
+{
+ "note": "Example: current flows per power net of the Nano reference board (4-layer ESP32 + LTE + GNSS).",
+ "flows": [
+  {
+   "net": "VBUS",
+   "source": "J1",
+   "sinks": [
+    "U14"
+   ],
+   "amps": 1.1
+  },
+  {
+   "net": "CHG_IN",
+   "source": "U14",
+   "sinks": [
+    "U1"
+   ],
+   "amps": 1.1
+  },
+  {
+   "net": "V5_12",
+   "source": "L12",
+   "sinks": [
+    "U14"
+   ],
+   "amps": 1.1
+  },
+  {
+   "net": "P12_IN",
+   "source": "J_12V",
+   "sinks": [
+    "D_REV12"
+   ],
+   "amps": 0.75
+  },
+  {
+   "net": "V12N",
+   "source": "D_REV12",
+   "sinks": [
+    "U12"
+   ],
+   "amps": 0.75
+  },
+  {
+   "net": "SW12",
+   "source": "U12",
+   "sinks": [
+    "L12"
+   ],
+   "amps": 1.4
+  },
+  {
+   "net": "BAT",
+   "source": "J_BAT",
+   "sinks": [
+    "U1"
+   ],
+   "amps": 2.6
+  },
+  {
+   "net": "SYS",
+   "source": "U1",
+   "sinks": [
+    "Q_SW"
+   ],
+   "amps": 2.6
+  },
+  {
+   "net": "SYS_SW",
+   "source": "Q_SW",
+   "sinks": [
+    "U11"
+   ],
+   "amps": 2.0
+  },
+  {
+   "net": "SYS_SW",
+   "source": "Q_SW",
+   "sinks": [
+    "U2"
+   ],
+   "amps": 0.4
+  },
+  {
+   "net": "SYS_SW",
+   "source": "Q_SW",
+   "sinks": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6"
+   ],
+   "amps": 0.1
+  },
+  {
+   "net": "SYS_SW",
+   "source": "Q_SW",
+   "sinks": [
+    "U13"
+   ],
+   "amps": 0.1
+  },
+  {
+   "net": "L1_MDM",
+   "source": "U11",
+   "sinks": [
+    "L_MDM"
+   ],
+   "amps": 2.6
+  },
+  {
+   "net": "L2_MDM",
+   "source": "U11",
+   "sinks": [
+    "L_MDM"
+   ],
+   "amps": 2.6
+  },
+  {
+   "net": "VMDM",
+   "source": "U11",
+   "sinks": [
+    "U7"
+   ],
+   "amps": 2.0
+  },
+  {
+   "net": "L1_3V3",
+   "source": "U2",
+   "sinks": [
+    "L_BUCK"
+   ],
+   "amps": 0.8
+  },
+  {
+   "net": "L2_3V3",
+   "source": "U2",
+   "sinks": [
+    "L_BUCK"
+   ],
+   "amps": 0.8
+  },
+  {
+   "net": "V3V3",
+   "source": "U2",
+   "sinks": [
+    "U4"
+   ],
+   "amps": 0.5
+  }
+ ]
+}
