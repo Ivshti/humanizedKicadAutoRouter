@@ -19,12 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import pcbnew
+from shapely.geometry import Point
 
 from boardModel import B, F, IN1, IN2, loadModel, ripCopper
-from emit import addPlanes, runDrc, writeRoutes
+from emit import addPlanes, floatingIslands, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from router import Knobs, Router
-from strategy import phaseOrder, plan
+from strategy import followLeaders, phaseOrder, plan
 
 
 def layersFor(c):
@@ -61,10 +62,16 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     order = phaseOrder(conns)
     t0 = time.perf_counter()
     failed = []
-    for i, c in enumerate(order):
-        if c.bundle and c.kind == "sig" and router.corridors is None:
-            # block wiring, GND and power are down: plan the channels for what is left
-            planCorridors(router, bundles, block, log)
+    first = [c for c in order if not (c.bundle and c.kind == "sig")]
+    later = [c for c in order if c.bundle and c.kind == "sig"]
+    for c in first:
+        st, _ = router.route(c, layersFor(c), winPadsFor(c), viaMm=viaMmFor(c, k))
+        if st != "ok":
+            failed.append(c)
+    # block wiring, GND and power are down: plan the channels for what is left, then lay
+    # each group's members in order across its width so they run side by side
+    planCorridors(router, bundles, block, log)
+    for c in followLeaders(sorted(later, key=lambda c: (c.groupRank, c.groupPos))):
         st, _ = router.route(c, layersFor(c), winPadsFor(c), viaMm=viaMmFor(c, k))
         if st != "ok":
             failed.append(c)
@@ -76,7 +83,7 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     queue = [c for c in failed if c.kind != "gnd"]
     rounds = 0
     attempts = Counter()
-    while queue and rounds < maxRounds * max(1, len(failed)):
+    while queue:  # bounded by the deadline and by maxRounds attempts per connection
         if deadline and time.perf_counter() > deadline:
             log("negotiation: deadline reached")
             break
@@ -130,8 +137,11 @@ def fixStarvedThermals(board, drc):
         if v["type"] != "starved_thermal":
             continue
         for it in v["items"]:
-            m = re.match(r"Pad (\S+) \[.*\] of (\S+) on", it["description"])
+            if it["description"].startswith("Zone"):  # the other side of the report
+                continue
+            m = re.search(r"[Pp]ad (\S+) \[[^]]*\] of (\S+)", it["description"])
             if not m:
+                print(f"thermals: cannot tell which pad from {it['description']!r}", file=sys.stderr)
                 continue
             fp = board.FindFootprintByReference(m.group(2))
             for pad in fp.Pads():
@@ -139,6 +149,32 @@ def fixStarvedThermals(board, drc):
                     pad.SetLocalZoneConnection(pcbnew.ZONE_CONNECTION_FULL)
                     n += 1
     return n
+
+
+def islandVias(board, router, net="GND"):
+    """Pieces of the outer GND pours that nothing connects would be removed, leaving holes
+    in the ground: each one with room for a via gets one down to the inner planes."""
+    nid = router.netId[net]
+    netInfo = board.GetNetsByName()[net]
+    rule = router.rules[net]
+    added = 0
+    for layer in (F, B):
+        anchors = [it.geom for it in router.sp.items.values()
+                   if it.net == nid and (layer in it.layers) and it.kind in ("pad", "track", "via")]
+        for piece in floatingIslands(board, layer, net, anchors):
+            room = piece.buffer(-(rule.viaDia / 2 + 0.05))
+            if room.is_empty:
+                continue
+            minx, miny, maxx, maxy = room.bounds
+            grid = [(x, y) for x in np.arange(minx, maxx, 0.3) for y in np.arange(miny, maxy, 0.3)]
+            pts = [(room.representative_point().x, room.representative_point().y)]
+            pts += [p for p in grid if room.contains(Point(p))][:40]
+            pt = router.placePlaneVia(pts, net)
+            if pt is not None:
+                via = router.viaItem(net, pt, rule, 0)
+                writeItem(board, netInfo, via)
+                added += 1
+    return added
 
 
 def cleanup(router, log, deadline=None, rounds=2):
@@ -182,6 +218,13 @@ def cleanup(router, log, deadline=None, rounds=2):
             router.improve(rid, layersFor(c), winPadsFor(c), viaMmFor(c, k) * k.viaCleanupMult)
     after = sum(router.routeCost(rid)[1] for rid, r in router.routes.items() if r.conn.kind in ("sig", "pwr"))
     log(f"via cleanup: {before} -> {after} signal/power vias")
+    # differential pairs that ended up apart: route both nets again, together
+    pairs = {id(r.conn): r.conn for r in router.routes.values() if r.conn.pairLeader is not None}
+    for follow in pairs.values():
+        lead = follow.pairLeader
+        was = router.coupling(lead, follow)
+        if was < 0.5 and router.repairPair(lead, follow, layersFor(lead), winPadsFor(lead), viaMmFor(lead, k)):
+            log(f"pair {lead.net}/{follow.net}: coupled {was:.0%} -> {router.coupling(lead, follow):.0%}")
 
 
 def main():
@@ -190,6 +233,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--minutes", type=float, default=25.0)
     ap.add_argument("--flows", help="JSON {flows: [{net, source, sinks, amps}]} sizing power copper")
+    ap.add_argument("--knob", action="append", default=[], metavar="NAME=VALUE",
+                    help="override a routing knob (see Knobs in router.py), e.g. viaMm=2.5")
     args = ap.parse_args()
     t0 = time.perf_counter()
     deadline = t0 + args.minutes * 60
@@ -218,7 +263,15 @@ def main():
     ripCopper(board)
     model = loadModel(board, os.path.join(srcDir, name + ".kicad_pro"))
     log(f"model: {len(model.pads)} pads, {len(model.nets)} nets, {len(model.keepouts)} keepouts")
-    router = Router(model, Knobs(), log)
+    knobs = Knobs()
+    for kv in args.knob:
+        key, value = kv.split("=", 1)
+        if not hasattr(knobs, key):
+            raise SystemExit(f"unknown knob {key!r}")
+        cur = getattr(knobs, key)
+        setattr(knobs, key, (value.lower() in ("1", "true", "yes")) if isinstance(cur, bool) else type(cur)(value))
+        log(f"knob {key} = {getattr(knobs, key)}")
+    router = Router(model, knobs, log)
     log(f"space: {router.sp.W}x{router.sp.H} cells @ {router.k.grid} mm")
     flows = []
     if args.flows:
@@ -228,7 +281,9 @@ def main():
     conns, block, bundles = plan(model, router, log, flows)
     for c in sorted((c for c in conns if c.amps > 0), key=lambda c: -c.amps)[:6]:
         log(f"  current: {c.net} {c.a.ref}->{c.b.ref} {c.amps:.2f} A -> {router.ruleForConn(c).width:.2f} mm")
-    unrouted = routeAll(router, conns, bundles, block, log, deadline=deadline)
+    # negotiation may use most of the budget; cleanup and planes need the rest
+    unrouted = routeAll(router, conns, bundles, block, log,
+                        deadline=t0 + args.minutes * 60 * 0.75)
     cleanup(router, log, deadline=deadline)
     log(f"search stats: {router.stats}")
     viaBy = Counter()
@@ -244,16 +299,25 @@ def main():
     log(f"vias by kind: {dict(viaBy)}")
     powerNets = {n for n, cls in model.netClass.items() if cls in router.k.powerWidth} | router.flowNets
     log(f"power copper: {router.fatten(powerNets)} tracks widened")
+    log(f"return vias: {router.returnVias()} GND vias beside signal vias")
     nStitch = router.stitch()
     log(f"stitching: {nStitch} GND vias")
     nT, nV = writeRoutes(board, router)
-    addPlanes(board, model.outline, [(F, "GND", True), (IN1, "GND", True), (IN2, "GND", True),
-                                     (B, "GND", True)])
+    planes = [(F, "GND", True), (IN1, "GND", True), (IN2, "GND", True), (B, "GND", True)]
+    addPlanes(board, model.outline, planes, removeIslands=False)
+    nIsl = islandVias(board, router)
+    for z in list(board.Zones()):
+        if not z.GetIsRuleArea() and z.GetNetname() == "GND":
+            board.Remove(z)
+    addPlanes(board, model.outline, planes)
+    log(f"pour islands: {nIsl} GND vias added so islands stay in the pour")
     board.Save(outBoard)
     log(f"wrote {outBoard}: {nT} tracks, {nV} vias")
     drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
-    solid = fixStarvedThermals(board, drc)
-    if solid:
+    for _ in range(3):  # a pad switched to solid can reveal the next one
+        solid = fixStarvedThermals(board, drc)
+        if not solid:
+            break
         pcbnew.ZONE_FILLER(board).Fill(board.Zones())
         board.Save(outBoard)
         log(f"thermals: {solid} GND pads switched to solid pour connection")

@@ -63,7 +63,7 @@ int astar(int L, int H, int W, const float *cost, const uint8_t *viaok, float vi
           const uint8_t *target, const uint8_t *tvia, const int32_t *src, int nsrc,
           float turn45, float turn90, float hweight, int tx0, int ty0, int tx1, int ty1,
           int32_t *outPath, int maxPath, int64_t maxExpand, int64_t *expandedOut,
-          const float *dirCost) {
+          const float *dirCost, float viaCostFar) {
   const int64_t plane = (int64_t)H * W;
   const int64_t N = plane * L;
   const int32_t TERM = (int32_t)N;  // pseudo node: terminal via
@@ -120,11 +120,12 @@ int astar(int L, int H, int W, const float *cost, const uint8_t *viaok, float vi
       }
     }
     if (viaok[yx]) {
+      const float vc = viaok[yx] == 2 ? viaCostFar : viaCost;
       for (int k = 0; k < L; k++) {
         if (k == l) continue;
         int32_t m = (int32_t)(k * plane + yx);
         if (cost[m] < 0 || closed[m]) continue;
-        float ng = gn + viaCost;
+        float ng = gn + vc;
         if (ng < g[m]) {
           g[m] = ng;
           par[m] = n;
@@ -133,7 +134,7 @@ int astar(int L, int H, int W, const float *cost, const uint8_t *viaok, float vi
         }
       }
       if (tvia && tvia[yx]) {
-        float ng = gn + viaCost;
+        float ng = gn + vc;
         if (ng < g[TERM]) {
           g[TERM] = ng;
           par[TERM] = n;

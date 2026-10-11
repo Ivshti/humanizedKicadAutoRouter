@@ -11,9 +11,11 @@
 import math
 from collections import defaultdict
 
+from boardModel import B
 from router import Conn
 
 PASSIVE_MAX_PADS = 4
+LONG_MM = 15.0
 SKIP_REFS = ("FID", "H", "TP")
 
 
@@ -125,6 +127,43 @@ def powerEdges(pads, flows, trunkMinAmps=0.3):
     return edges
 
 
+PAIR_SUFFIXES = (("_DP", "_DN"), ("_P", "_N"), ("+", "-"), ("H", "L"))
+
+
+def pairPartners(nets):
+    """Differential pairs by name: X_DP/X_DN, X_P/X_N, X+/X-, and CANH/CANL style."""
+    out = {}
+    for n in nets:
+        for p, q in PAIR_SUFFIXES:
+            if n.endswith(p) and len(n) > len(p):
+                m = n[:-len(p)] + q
+                if m in nets and (p, q) != ("H", "L") or (m in nets and n.upper().startswith("CAN")):
+                    out[n], out[m] = m, n
+                break
+    return out
+
+
+def linkPairs(conns, partners):
+    """Pair each connection of a pair's first net with the connection of its partner that
+    joins the same two parts; the second follows the first."""
+    byNet = defaultdict(list)
+    for c in conns:
+        byNet[c.net].append(c)
+    n = 0
+    for net, other in partners.items():
+        if net > other:
+            continue
+        for c in byNet[net]:
+            ends = {c.a.ref, c.b.ref}
+            mates = [d for d in byNet[other] if d.pairLeader is None and {d.a.ref, d.b.ref} == ends]
+            if mates:
+                mates[0].pairLeader = c
+                c.pairMate = mates[0]
+                mates[0].pairMate = c
+                n += 1
+    return n
+
+
 def plan(model, router, log=print, flows=()):
     planeNets = router.planeNets
     block = buildBlocks(model, planeNets)
@@ -167,10 +206,16 @@ def plan(model, router, log=print, flows=()):
         if c.bundle and c.kind == "sig":
             bundles[c.bundle].append(c)
     for c in conns:
-        if c.kind in ("sig", "pwr") and c.prefLayer < 0:
+        if (c.kind == "pwr" or (c.kind == "sig" and not c.bundle)) and c.order > LONG_MM and c.amps <= 1.0:
+            # long runs travel on the bottom, like on a hand-routed board; high-current
+            # trunks stay on one layer instead
+            c.prefLayer = B
+        elif c.kind in ("sig", "pwr") and c.prefLayer < 0:
             # block internals stay on the side their parts sit on
             c.prefLayer = c.a.side if c.a.side == c.b.side else -1
-    log(f"plan: {len(conns)} connections, {len(set(block.values()))} blocks, {len(bundles)} bundles")
+    nPairs = linkPairs(conns, pairPartners(set(model.nets)))
+    log(f"plan: {len(conns)} connections, {len(set(block.values()))} blocks, {len(bundles)} bundles, "
+        f"{nPairs} differential pair links")
     return conns, block, bundles
 
 
@@ -186,4 +231,18 @@ def phaseOrder(conns):
         if c.kind == "pwr":
             return (3, -c.amps, c.order)
         return (4, 0, c.bundle, c.order)
-    return sorted(conns, key=key)
+    return followLeaders(sorted(conns, key=key))
+
+
+def followLeaders(order):
+    """The second net of a differential pair is routed right after the first."""
+    present = {id(c) for c in order}
+    followers = {id(c.pairLeader): c for c in order if c.pairLeader is not None}
+    out = []
+    for c in order:
+        if c.pairLeader is not None and id(c.pairLeader) in present:
+            continue
+        out.append(c)
+        if id(c) in followers:
+            out.append(followers[id(c)])
+    return out

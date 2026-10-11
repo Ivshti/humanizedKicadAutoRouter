@@ -8,7 +8,9 @@ is negotiated (overfull tiles get dearer each round), and a tile another group a
 runs through is cheaper while it has room, so groups merge into shared trunks the way a
 person runs several buses side by side. Running across other wiring on the same layer
 costs what it costs on the board, a via pair per member, so crossing bundles end up on
-opposite layers. The detailed router then pays extra to leave its
+opposite layers. As on a hand-routed board, the bottom is the long-distance layer: the
+top costs more to travel on, so a bundle escapes its pins on top, drops to the bottom
+near them and comes back up at the far end, unless it is short. The detailed router then pays extra to leave its
 group's corridor, and the corridor's layer replaces a per-bundle layer guess.
 """
 import ctypes
@@ -171,7 +173,8 @@ class Corridors:
                                 tgt.ctypes.data, None, src.ctypes.data, len(src),
                                 ctypes.c_float(0.05), ctypes.c_float(0.25), ctypes.c_float(1.0),
                                 min(tjs), min(tis), max(tjs), max(tis), out.ctypes.data, len(out),
-                                ctypes.c_int64(10_000_000), None, dirCost.ctypes.data)
+                                ctypes.c_int64(10_000_000), None, dirCost.ctypes.data,
+                                ctypes.c_float(k.corridorViaMm / self.T))
         if n <= 0:
             return None
         path = []
@@ -202,6 +205,9 @@ class Corridors:
                 cost = (1.0 + hist) * (1.0 + pres * over / g["n"])
                 cost[(use > 0) & (over == 0)] *= k.corridorShare
                 cost[cap < 0.25] *= 20.0
+                # the top is for parts and their local wiring: a bundle travels on the
+                # bottom unless it is short enough that two vias per member cost more
+                cost[0] *= k.corridorTopMult
                 g["path"] = self.searchGroup(g, cost.astype(np.float32), self.dirCost(axisUse, g))
                 if g["path"] is not None:
                     for t in set(g["path"]):
@@ -228,10 +234,13 @@ class Corridors:
                   sum(t[0] for t in g["path"]) * 2 > len(g["path"]))
         log(f"corridors: {len(gs)} groups, {it + 1} rounds, {nHot} overfull tiles left, "
             f"~{nVia} planned vias, {onB}/{sum(g['n'] for g in gs)} members mostly on bottom")
-        for g in gs:
+        for rank, g in enumerate(gs):
             mask = self.corridorMask(g)
-            for c in g["conns"]:
+            viaZone = self.viaZone(g)
+            for pos, c in enumerate(g["conns"]):
                 c.corridor = mask
+                c.corridorVia = viaZone
+                c.groupRank, c.groupPos = rank, pos
                 c.prefLayer = -1
         return gs
 
@@ -253,9 +262,20 @@ class Corridors:
             m[:, max(min(ti) - 1, 0):max(ti) + 2, max(min(tj) - 1, 0):max(tj) + 2] = True
         return m
 
+    def viaZone(self, g):
+        """Tiles where the plan changes layer (and one tile around): with the escapes next
+        to the pads, the only places a member may take a via."""
+        if g["path"] is None:
+            return None
+        z = np.zeros((self.TH, self.TW), bool)
+        for a, b in zip(g["path"], g["path"][1:]):
+            if a[0] != b[0]:
+                z[max(a[1] - 1, 0):a[1] + 2, max(a[2] - 1, 0):a[2] + 2] = True
+        return z
+
     def fine(self, mask, li, win):
         """Corridor of one layer over a fine-raster window."""
         i0, j0, i1, j1 = win
         ti = np.minimum(np.arange(i0, i1) // self.s, self.TH - 1)
         tj = np.minimum(np.arange(j0, j1) // self.s, self.TW - 1)
-        return mask[li][np.ix_(ti, tj)]
+        return (mask if li is None else mask[li])[np.ix_(ti, tj)]

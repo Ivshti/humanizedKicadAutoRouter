@@ -19,6 +19,11 @@ from boardModel import B, F, IN1, IN2
 from native import edt
 from space import HARD, NLAYERS, Item, Space
 
+# shapely's round shapes are polygons inside the true circle; scale them so the polygon
+# lies outside it and every clearance it passes holds for the real round copper
+CIRC = 1 / math.cos(math.pi / 64)
+
+
 @dataclass
 class Knobs:
     grid: float = 0.025
@@ -31,7 +36,12 @@ class Knobs:
     otherLayerMult: float = 2.5
     neckMm: float = 1.0          # power tracks may neck down this close to their own pads
     escapeMm: float = 1.5        # body keep-outs do not apply this close to the route's own pads
+    escapeViaMm: float = 4.0     # a bundle member's vias belong this close to its pads (or at
+                                 # a planned layer change)
+    farViaMult: float = 5.0      # a via anywhere else costs this many vias
     attractMult: float = 0.55    # bundle members pay this much less one pitch from a sibling
+    hugMult: float = 0.8         # signals pay this much less one clearance from other wiring
+    pairMult: float = 0.3        # a pair's second net pays this much less at the pair gap
     thermalPenalty: float = 2.0  # cost added on GND pads' thermal spoke corridors
     bodyMinAreaMm2: float = 40.0
     stitchPitchMm: float = 4.0
@@ -39,10 +49,12 @@ class Knobs:
     outerUm: float = 35.0
     ampMargin: float = 1.08
     hweight: float = 1.15
+    minHeuristic: float = 0.3    # floor on the estimate's scale (search speed vs. optimality)
     negotiatePenalty: float = 6.0
     corridorTileMm: float = 2.0
     corridorOut: float = 3.0     # bundle members pay this much more outside their corridor
     corridorViaMm: float = 4.0   # what a layer change costs a corridor, per member
+    corridorTopMult: float = 1.8 # travelling on the top costs this much more than the bottom
     corridorShare: float = 0.75  # a corridor tile another group runs through, while it has room
     viaCleanupMult: float = 4.0  # the last cleanup pass prices vias this much higher
     joinMm: float = 6.0          # bundle members whose ends are this close share a corridor
@@ -88,6 +100,11 @@ class Conn:
     order: float = 0.0
     amps: float = 0.0         # current this connection carries (power flows); 0 = unknown
     corridor: object = None   # (2, tiles, tiles) bool: where its bundle group runs, F and B
+    corridorVia: object = None  # (tiles, tiles) bool: where its group's plan changes layer
+    groupRank: int = 0        # corridor group, in planning order
+    groupPos: int = 0         # position across the group's width
+    pairLeader: object = None # set on a pair's second net: the first net's connection
+    pairMate: object = None   # both nets of a pair: the other one's connection
 
 
 @dataclass
@@ -178,7 +195,7 @@ class Router:
                         sub[mask] = nid
         hc = self.m.minHoleClearance - self.sp.defaultClearance
         for (x, y, r, hnet) in self.m.holes:
-            geom = Point(x, y).buffer(r)
+            geom = Point(x, y).buffer(r * CIRC, 16)
             hid = self.netId[hnet] if hnet else HARD
             it = Item(0, hid, "hole", tuple(range(NLAYERS)), geom, 0.0, pts=((x, y),), drill=2 * r)
             sp.add(it)
@@ -322,7 +339,8 @@ class Router:
         padDist = edt(own) * g if own.any() else np.full((h, w), 1e3)
         escape = padDist < k.escapeMm
         neckZone = padDist < k.neckMm if rule.narrow < rule.width else np.zeros((h, w), bool)
-        attract = self.bundleAttraction(conn, rule, win, layers) if conn.bundle else None
+        hug = self.hugMasks(conn, rule, win, layers) if conn.kind == "sig" else None
+        pair = self.pairBand(conn, rule, win, layers)
         cost = np.empty((len(layers), h, w), np.float32)
         wideOk = np.empty((len(layers), h, w), bool)
         for li, l in enumerate(layers):
@@ -347,8 +365,12 @@ class Router:
             c += self.hist[l, i0:i1, j0:j1]
             if not plane:
                 c += self.thermalCost[l, i0:i1, j0:j1]
-            if attract is not None:
-                c[attract[li]] *= k.attractMult
+            if hug is not None:
+                own, other = hug
+                c[own[li]] *= k.attractMult
+                c[other[li] & ~own[li]] *= k.hugMult
+            if pair is not None:
+                c[pair[0][li]] *= k.pairMult
             if conn.corridor is not None and l in (F, B):
                 inside = self.corridors.fine(conn.corridor, 0 if l == F else 1, win)
                 c[~inside & ~escape] *= k.corridorOut
@@ -378,37 +400,85 @@ class Router:
         viaok &= ~sp.viaKeep[i0:i1, j0:j1]
         if not plane:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
-        viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: a == nid) >= rv + 0.03
+        # one cell of raster slack: a pad corner can rasterise one cell short
+        viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: a == nid) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
         viaok &= self.holeDist[i0:i1, j0:j1] >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: a == nid) >= \
             rule.viaDrill + self.m.minHoleToHole + m
+        viaok = viaok.astype(np.uint8)
+        # a bundle member or pair wants its vias at its escapes and planned layer changes
+        # (a pair: beside the first net's vias); anywhere else a via costs more (marked 2)
+        want = None
+        if pair is not None:
+            want = (padDist < k.escapeViaMm) | pair[1]
+        elif conn.corridorVia is not None:
+            want = (padDist < k.escapeViaMm) | self.corridors.fine(conn.corridorVia, None, win)
+        if want is not None:
+            viaok[(viaok == 1) & ~want] = 2
         for (p, r) in getattr(self, "forbidVias", ()):
             ys, xs = sp.cellCenters(win)
-            viaok &= (xs - p[0]) ** 2 + (ys - p[1]) ** 2 >= r * r
-        return cost, viaok.astype(np.uint8), wideOk, None
+            viaok[(xs - p[0]) ** 2 + (ys - p[1]) ** 2 < r * r] = 0
+        return cost, viaok, wideOk, None
 
-    def bundleAttraction(self, conn, rule, win, layers):
-        """Cells one track pitch away from tracks already laid by the same bundle."""
-        sp, g = self.sp, self.k.grid
+    def pairBand(self, conn, rule, win, layers):
+        """For a differential pair net whose partner is already routed: cells at the pair
+        gap from the partner's tracks (per layer), and cells within reach of its vias.
+        Either net may be the one routed second (push and shove can rip either)."""
+        lead = conn.pairMate
+        if lead is None or not lead.routed or lead.rid not in self.routes:
+            return None
+        sp, g, k = self.sp, self.k.grid, self.k
+        i0, j0, i1, j1 = win
+        h, w = i1 - i0, j1 - j0
+        items = [sp.items[i] for i in self.routes[lead.rid].items]
+        band = np.zeros((len(layers), h, w), bool)
+        gap = rule.width / 2 + self.m.classes[rule.cls].pairGap + k.margin
+        for li, l in enumerate(layers):
+            m = np.zeros((h, w), bool)
+            for it in items:
+                if it.kind == "track" and l in it.layers:
+                    self.paint(m, win, it)
+            if m.any():
+                d = edt(m) * g
+                band[li] = (d >= gap) & (d <= gap + 2 * g)
+        nearVia = np.zeros((h, w), bool)
+        vias = [it for it in items if it.kind == "via"]
+        if vias:
+            ys, xs = sp.cellCenters(win)
+            for v in vias:
+                nearVia |= (xs - v.pts[0][0]) ** 2 + (ys - v.pts[0][1]) ** 2 <= 1.5 ** 2
+        return band, nearVia
+
+    def hugMasks(self, conn, rule, win, layers):
+        """Cells where this track would run exactly one clearance beside existing signal or
+        power copper on the same layer: beside its own bundle (own) and beside anything
+        else (other). Packing tracks together keeps the space left over in one piece, so
+        the ground pour can fill it."""
+        sp, g, k = self.sp, self.k.grid, self.k
         i0, j0, i1, j1 = win
         h, w = i1 - i0, j1 - j0
         x0, y0 = sp.toMm(i0, j0)
         x1, y1 = sp.toMm(i1, j1)
-        out = np.zeros((len(layers), h, w), bool)
-        pitch = rule.width + rule.clearance + self.k.margin
+        own = np.zeros((len(layers), h, w), bool)
+        other = np.zeros((len(layers), h, w), bool)
+        nid = self.netId[conn.net]
+        plane = {self.netId[n] for n in self.planeNets}
+        band = rule.width / 2 + rule.clearance + k.margin
         for li, l in enumerate(layers):
-            mask = np.zeros((h, w), bool)
+            mOwn = np.zeros((h, w), bool)
+            mAll = np.zeros((h, w), bool)
             for it in sp.query([l], (x0, y0, x1, y1)):
-                if it.kind != "track" or it.net == self.netId[conn.net]:
+                if it.kind != "track" or it.net == nid or it.net in plane:
                     continue
+                self.paint(mAll, win, it)
                 r = self.routes.get(it.route)
-                if r is None or r.conn.bundle != conn.bundle:
-                    continue
-                self.paint(mask, win, it, "land")
-            if mask.any():
-                d = edt(mask) * g
-                out[li] = (d >= pitch - g) & (d <= pitch + 2 * g)
-        return out
+                if conn.bundle and r is not None and r.conn.bundle == conn.bundle:
+                    self.paint(mOwn, win, it)
+            for mask, out in ((mOwn, own), (mAll, other)):
+                if mask.any():
+                    d = edt(mask) * g
+                    out[li] = (d >= band) & (d <= band + 2 * g)
+        return own, other
 
     def cachedMask(self, item, key="copper"):
         """(win, mask) raster of an item, computed once: copper shape, or the centreline
@@ -516,14 +586,19 @@ class Router:
         outPath = np.empty(min(maxPath, 4_000_000), np.int32)
         expanded = ctypes.c_int64(0)
         cost = np.ascontiguousarray(cost)
+        # the distance estimate must not exceed what the cheapest cells cost, or the
+        # search runs straight past discounted (hugging, pair-following) paths
+        free = cost[cost > 0]
+        hweight = k.hweight * max(min(1.0, float(free.min()) if free.size else 1.0), k.minHeuristic)
         t0 = time.perf_counter()
         n = self.kernel.astar(Ls, h, w, cost.ctypes.data, viaok.ctypes.data, ctypes.c_float(vCost),
                               tgt.ctypes.data, tvia.ctypes.data if tvia is not None else None,
                               srcIdx.ctypes.data, len(srcIdx), ctypes.c_float(k.turn45Mm / k.grid),
                               ctypes.c_float(k.turn90Mm / k.grid),
-                              ctypes.c_float(0.0 if toPlane else k.hweight),
+                              ctypes.c_float(0.0 if toPlane else hweight),
                               tx0, ty0, tx1, ty1, outPath.ctypes.data, len(outPath),
-                              ctypes.c_int64(k.maxExpand), ctypes.byref(expanded), None)
+                              ctypes.c_int64(k.maxExpand), ctypes.byref(expanded), None,
+                              ctypes.c_float(vCost * k.farViaMult))
         self.stats["searches"] += 1
         self.stats["searchS"] += time.perf_counter() - t0
         if n <= 0:
@@ -574,12 +649,13 @@ class Router:
         return out, vias
 
     def trackItem(self, net, layer, p1, p2, width, clearance, rid):
-        geom = LineString([p1, p2]).buffer(width / 2, 16) if p1 != p2 else Point(p1).buffer(width / 2, 16)
+        r = width / 2 * CIRC
+        geom = LineString([p1, p2]).buffer(r, 16) if p1 != p2 else Point(p1).buffer(r, 16)
         return Item(0, self.netId[net], "track", (layer,), geom, clearance, width=width,
                     pts=(p1, p2), route=rid)
 
     def viaItem(self, net, p, rule, rid):
-        geom = Point(p).buffer(rule.viaDia / 2, 16)
+        geom = Point(p).buffer(rule.viaDia / 2 * CIRC, 16)
         return Item(0, self.netId[net], "via", tuple(range(NLAYERS)), geom, rule.clearance,
                     width=rule.viaDia, pts=(p,), drill=rule.viaDrill, route=rid)
 
@@ -786,6 +862,50 @@ class Router:
         self.restore(r)
         return False
 
+    # ---- differential pairs -------------------------------------------------------------
+    def coupling(self, c1, c2, reach=0.35):
+        """Share of c1's track length that runs beside c2's tracks (same layer, edge gap
+        within reach)."""
+        if c1.rid not in self.routes or c2.rid not in self.routes:
+            return 0.0
+        t1 = [self.sp.items[i] for i in self.routes[c1.rid].items if self.sp.items[i].kind == "track"]
+        t2 = [self.sp.items[i] for i in self.routes[c2.rid].items if self.sp.items[i].kind == "track"]
+        total = near = 0.0
+        for a in t1:
+            seg = LineString(a.pts)
+            n = max(2, int(seg.length / 0.2) + 1)
+            for i in range(n):
+                p = seg.interpolate(i / (n - 1), normalized=True)
+                total += seg.length / n
+                if any(b.layers == a.layers and LineString(b.pts).distance(p) <= (a.width + b.width) / 2 + reach
+                       for b in t2):
+                    near += seg.length / n
+        return near / total if total else 0.0
+
+    def repairPair(self, lead, follow, layers, winPads, viaMm):
+        """Rip both nets of a loosely coupled pair and route them again together; keep the
+        new pair only if it couples better."""
+        old = [self.routes.get(c.rid) for c in (lead, follow)]
+        if any(r is None or self.children.get(r.rid) for r in old):
+            return False
+        before = self.coupling(lead, follow)
+        for r in old:
+            r.oldItems = [self.sp.items[i] for i in r.items]
+            self.rip(r.rid)
+        new = []
+        for c in (lead, follow):
+            st, rt = self.route(c, layers, winPads, viaMm=viaMm)
+            if st != "ok" or rt is None:
+                break
+            new.append(rt)
+        if len(new) == 2 and self.coupling(lead, follow) > before + 0.1:
+            return True
+        for rt in new:
+            self.rip(rt.rid)
+        for r in old:
+            self.restore(r)
+        return False
+
     # ---- power copper ------------------------------------------------------------------
     def padUnder(self, net, layer, p):
         nid = self.netId[net]
@@ -835,8 +955,8 @@ class Router:
         return grown
 
     # ---- plane stitching ----------------------------------------------------------------
-    def stitch(self, net="GND"):
-        """GND via field on a square grid (snapped to the nearest legal spot near each node)."""
+    def stitchMask(self, net="GND"):
+        """Cells where a plane via may go, judged on the current board."""
         sp, k = self.sp, self.k
         rule = self.rules[net]
         nid = self.netId[net]
@@ -848,33 +968,78 @@ class Router:
         ok &= (edt(sp.smdPad != 0) * sp.g) >= rv + 0.1
         ok &= self.holeDist >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         ok &= sp.maskDist(sp.viaAt, win, reach=0, pred=lambda a: a != 0) >= rule.viaDrill + 0.6
-        conn = Conn(0, net, None, None, "stitch")
+        return ok
+
+    def placePlaneVia(self, pts, net="GND"):
+        """Put a plane via at the first of pts that passes the exact check."""
+        sp = self.sp
+        rule = self.rules[net]
+        nid = self.netId[net]
+        for pt in pts:
+            rid = self.nextRid
+            via = self.viaItem(net, pt, rule, rid)
+            if self.check(via):
+                continue
+            self.nextRid += 1
+            via.route = rid
+            sp.add(via)
+            self.netItems.setdefault(nid, set()).add(via.iid)
+            self.routes[rid] = Route(rid, Conn(0, net, None, None, "stitch"), [via.iid],
+                                     [("plane", net)], set())
+            return pt
+        return None
+
+    def nearestOk(self, ok, x, y, radiusMm, n=6, minMm=0.0):
+        """Up to n legal cells nearest to (x, y), within radiusMm (and at least minMm)."""
+        sp = self.sp
+        i, j = sp.toCell(x, y)
+        r = int(radiusMm / sp.g)
+        a0, b0 = max(i - r, 0), max(j - r, 0)
+        sub = ok[a0:i + r + 1, b0:j + r + 1]
+        if not sub.any():
+            return []
+        ii, jj = np.nonzero(sub)
+        d = (ii + a0 - i) ** 2 + (jj + b0 - j) ** 2
+        keep = (d <= r * r) & (d >= (minMm / sp.g) ** 2)
+        ii, jj, d = ii[keep], jj[keep], d[keep]
+        return [sp.toMm(ii[x] + a0, jj[x] + b0) for x in np.argsort(d)[:n]]
+
+    def returnVias(self, net="GND", reach=1.5):
+        """A plane via next to every signal via that has none within reach: the return
+        current of a track that changes layers changes planes there too."""
+        sp = self.sp
+        ok = self.stitchMask(net)
+        nid = self.netId[net]
+        gnd = [it.pts[0] for it in sp.items.values() if it.kind == "via" and it.net == nid]
+        added = 0
+        for it in list(sp.items.values()):
+            if it.kind != "via" or it.net == nid:
+                continue
+            x, y = it.pts[0]
+            if any(math.dist(g, (x, y)) <= reach for g in gnd):
+                continue
+            pt = self.placePlaneVia(self.nearestOk(ok, x, y, reach, minMm=0.0), net)
+            if pt is not None:
+                gnd.append(pt)
+                i, j = sp.toCell(*pt)
+                r = int(0.9 / sp.g)
+                ok[max(i - r, 0):i + r + 1, max(j - r, 0):j + r + 1] = False
+                added += 1
+        return added
+
+    def stitch(self, net="GND"):
+        """GND via field on a square grid (snapped to the nearest legal spot near each node)."""
+        sp, k = self.sp, self.k
+        ok = self.stitchMask(net)
         p = k.stitchPitchMm
         minx, miny, maxx, maxy = self.m.outline.bounds
         added = 0
-        snap = int(p / 3 / sp.g)
         y = miny + p / 2
         while y < maxy:
             x = minx + p / 2
             while x < maxx:
-                i, j = sp.toCell(x, y)
-                a0, b0 = max(i - snap, 0), max(j - snap, 0)
-                sub = ok[a0:i + snap + 1, b0:j + snap + 1]
-                if sub.any():
-                    ii, jj = np.nonzero(sub)
-                    d = (ii + a0 - i) ** 2 + (jj + b0 - j) ** 2
-                    for idx in np.argsort(d)[:6]:
-                        pt = sp.toMm(ii[idx] + a0, jj[idx] + b0)
-                        rid = self.nextRid
-                        via = self.viaItem(net, pt, rule, rid)
-                        if not self.check(via):
-                            self.nextRid += 1
-                            via.route = rid
-                            sp.add(via)
-                            self.netItems.setdefault(nid, set()).add(via.iid)
-                            self.routes[rid] = Route(rid, conn, [via.iid], [("plane", net)], set())
-                            added += 1
-                            break
+                if self.placePlaneVia(self.nearestOk(ok, x, y, p / 3), net) is not None:
+                    added += 1
                 x += p
             y += p
         return added

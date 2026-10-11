@@ -20,7 +20,7 @@ def _load():
     k.astar.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, P, P, ctypes.c_float, P, P, P,
                         ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float,
                         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, P, ctypes.c_int,
-                        ctypes.c_int64, P, P]
+                        ctypes.c_int64, P, P, ctypes.c_float]
     k.edt2d.restype = None
     k.edt2d.argtypes = [P, ctypes.c_int, ctypes.c_int, P]
     return k

@@ -25,6 +25,7 @@ class NetClass:
     clearance: float
     viaDia: float
     viaDrill: float
+    pairGap: float        # differential pair gap (edge to edge)
 
 
 @dataclass
@@ -98,7 +99,8 @@ def readClasses(proPath):
     classes = {}
     for c in ns["classes"]:
         classes[c["name"]] = NetClass(c["name"], c["track_width"], c["clearance"],
-                                      c["via_diameter"], c["via_drill"])
+                                      c["via_diameter"], c["via_drill"],
+                                      max(c.get("diff_pair_gap") or 0.0, c["clearance"]))
     patterns = [(p["pattern"], p["netclass"]) for p in (ns.get("netclass_patterns") or [])]
     rules = pro["board"]["design_settings"]["rules"]
     return classes, patterns, rules

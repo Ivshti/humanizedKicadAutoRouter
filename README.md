@@ -6,7 +6,7 @@ buses in planned corridors. It runs headless, writes a routed copy of your
 board, and only counts the result as done once KiCad's own DRC agrees.
 
 On a dense 88 × 70 mm 4-layer board (ESP32 module, LTE modem, GNSS receiver and
-patch antenna, chargers, 162 parts) it routes the fully ripped board in about 6
+patch antenna, chargers, 162 parts) it routes the fully ripped board in 6–10
 minutes on an M3 Max. That board took about 3 hours by hand. The result has no
 DRC errors or warnings and no unconnected items.
 
@@ -26,6 +26,7 @@ Your input board is never modified.
 - [House rules it follows](#house-rules-it-follows)
 - [Reviewing the result](#reviewing-the-result)
 - [Limits today](#limits-today)
+- [Open items](#open-items)
 
 ---
 
@@ -68,6 +69,7 @@ Options:
 | `--out DIR` | where the routed copy goes (required) |
 | `--flows FILE` | how much current each power net carries; see below |
 | `--minutes N` | time budget, default 25; it stops negotiating when this runs out |
+| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=2.5`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py` |
 
 Progress is printed as it goes. The last line is the DRC result, for example
 `DRC: 0 violations {}, 0 unconnected`.
@@ -150,6 +152,9 @@ check the following.
    copper goes under their bodies on their side. Their own pins can still
    escape outward.
 9. **Fiducials (`FID…`) and mounting holes (`H…`)** are left alone.
+10. **Differential pairs** are found by name: `X_DP`/`X_DN`, `X_P`/`X_N`,
+    `X+`/`X-`, and `CANH`/`CANL`. The pair gap is the net class's diff-pair
+    gap from the `.kicad_pro`.
 
 Any existing tracks, vias and copper pours are removed before routing. The
 router always starts from a clean board.
@@ -210,10 +215,18 @@ It follows the order a person uses:
 5. **Plan corridors.** With the blocks and power down, it decides where each
    bundle will run and on which layer, on a coarse map of the space that is
    left:
+   - The bottom is the long-distance layer, as on a hand-routed board. A bundle
+     escapes its pins on the top, drops to the bottom close to them, travels
+     there and comes back up near its far end. Only short bundles stay on top.
    - Bundles that can share a channel are drawn into it, side by side.
    - A bundle that would cross other wiring on the same layer is sent to the
-     other layer instead.
-6. **Route the bundles** inside their corridors.
+     other layer instead, because every such crossing costs a pair of vias.
+6. **Route the bundles** inside their corridors, one member after the other in
+   order across the bundle, so they lie side by side instead of crossing. A
+   member's vias belong next to its own pins or where its corridor planned a
+   layer change; a via anywhere else is priced like three, so mid-route hops
+   are a last resort. The second net of a differential pair follows the first
+   at the pair gap and changes layer right beside it.
 7. **Push and shove.** A connection that cannot get through may route across
    others at a price. The ones it crossed are ripped and routed again, and the
    board remembers where the fights were.
@@ -223,11 +236,20 @@ It follows the order a person uses:
 9. **Power copper.** Every power track is widened to the widest that fits, so
    neighbouring tracks of one net overlap into a small pour, the way a person
    lays overlapping thick tracks. A track that ends on a pad grows no wider
-   than that pad.
-10. **Planes and stitching.** Ground is poured on all four layers and stitched
-    with a via grid. A ground pad whose thermal spokes end up blocked is given
-    a solid connection.
-11. **Check.** KiCad's DRC runs on the saved board and its result is reported.
+   than that pad. Long low-current power runs travel on the bottom.
+10. **Return vias.** Every signal via without a ground via within 1.5 mm gets
+    one beside it, so the return current can change planes where the signal
+    changes layers.
+11. **Planes and stitching.** Ground is poured on all four layers and stitched
+    with a via grid. A piece of the outer pour that nothing connects would be
+    removed and leave a hole in the ground; each one with room for a via gets
+    one. A ground pad whose thermal spokes end up blocked is given a solid
+    connection.
+12. **Check.** KiCad's DRC runs on the saved board and its result is reported.
+
+Throughout, signal tracks are drawn to run one clearance away from existing
+wiring. Tracks pack together the way a person nudges them, and the space left
+over stays in one piece for the ground pour.
 
 All tracks are horizontal, vertical or 45°.
 
@@ -251,27 +273,53 @@ All tracks are horizontal, vertical or 45°.
 ```sh
 ./render.sh routed/myboard.kicad_pcb previews/         # top, bottom, both, inner-2 as PNG
 $KPY metrics.py my-hand-routed.kicad_pcb routed/myboard.kicad_pcb
+$KPY analyze.py my-hand-routed.kicad_pcb routed/myboard.kicad_pcb
 ```
 
 `metrics.py` prints track length per layer, via counts (ground vs.
-signal/power) and how many segments are not 0/45/90°. It is handy for
-comparing against a hand-routed version of the same board.
+signal/power) and how many segments are not 0/45/90°.
+
+`analyze.py` looks at the things a reviewer looks at:
+
+- **direction:** track length per layer by direction, for all tracks and for
+  long ones. It shows whether each layer has a main direction.
+- **vias:** signal vias, and how many have no ground via within 1.5 mm.
+- **reference:** signal track length that does not run over the neighbouring
+  inner ground plane, for example over a slot between via clearances.
+- **pour gaps:** areas on the outer layers with no copper at all, larger than
+  1 mm², i.e. places the ground pour could not reach.
+
+All three are handy for comparing against a hand-routed version of the same
+board.
 
 ---
 
 ## Limits today
 
-- **More vias than a person uses.** On the reference board: 185
-  signal/power vias against 77 by hand. Ground vias are 450 against 314, of
-  which more than 300 are the stitching grid. Most of the extra vias are short
-  hops where a bus crosses other wiring.
+Numbers are from the reference board, compared with the same board routed by hand.
+
+- **More vias than a person uses.** About 160–180 signal/power vias against 77
+  by hand. Most are escape vias next to the pins, two per long bundle member.
+  Your hand-routed board keeps more long runs on top. Mid-route hops have come
+  down but are still several times the hand-routed count.
+- **Differential pairs** are coupled where there is room, and pairs that end
+  up apart are re-routed together. On the reference board USB comes out about
+  two-thirds coupled, like the hand-routed board. The long CAN pair varies
+  from run to run (20–85%). Lengths are not matched.
 - **4-layer boards with a `GND` net only.** Other stack-ups and plane nets
   need small changes.
-- **Ground pads without room for a fanout via** (for example the inner pads of
-  a large LGA module) are connected through the top pour rather than a via of
-  their own. DRC confirms they are connected.
-- **Differential pairs** are routed as two neighbouring tracks. They are not
-  length- or gap-matched.
-- **Runs are not deterministic.**
+- **Run time** is 6–10 minutes on the reference board. Most of it is push and
+  shove, and it depends on how crowded the board is.
+- **Runs are not deterministic.** Most of the variation comes from push and
+  shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left
   unconnected.
+
+---
+
+## Open items
+
+- **Component placement.** The router takes placement as given. Placing parts
+  the way a person would, with blocks grouped and connectors and modules
+  where they must be, is the next big piece. It would let the tool start from a
+  schematic, not a placed board.
