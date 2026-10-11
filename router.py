@@ -144,7 +144,8 @@ class Router:
         cls = self.m.netClass.get(net, "Default")
         nc = self.m.classes[cls]
         if cls in self.k.powerWidth:
-            w, narrow = self.k.powerWidth[cls], nc.width
+            # power may neck to signal width at its pins (fine-pitch regulators)
+            w, narrow = self.k.powerWidth[cls], min(nc.width, self.k.signalWidth)
         elif cls == "Default":
             w, narrow = self.k.signalWidth, nc.width
         else:

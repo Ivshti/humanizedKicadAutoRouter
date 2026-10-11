@@ -85,7 +85,10 @@ class Space:
         minx, miny, maxx, maxy = bounds
         i0, j0 = self.toCell(minx - pad, miny - pad)
         i1, j1 = self.toCell(maxx + pad, maxy + pad)
-        return (max(i0, 0), max(j0, 0), min(i1 + 1, self.H), min(j1 + 1, self.W))
+        i0, j0 = min(max(i0, 0), self.H), min(max(j0, 0), self.W)
+        # an end below zero would read as "from the end" in a numpy slice: clamp both ends
+        # into the raster so a window off the board is empty, not most of the board
+        return (i0, j0, max(min(i1 + 1, self.H), i0), max(min(j1 + 1, self.W), j0))
 
     # ---- rasterising -------------------------------------------------------------
     def rasterMask(self, geom, grow=0.0):
@@ -93,8 +96,8 @@ class Space:
         g = geom.buffer(grow) if grow else geom
         shapely.prepare(g)  # in place; contains_xy over many cells is ~100x faster
         win = self.winFor(g.bounds, self.g)
-        if win[2] <= win[0] or win[3] <= win[1]:
-            return win, np.zeros((0, 0), bool)
+        if win[2] <= win[0] or win[3] <= win[1]:  # off the board: empty, but the window's shape
+            return win, np.zeros((max(win[2] - win[0], 0), max(win[3] - win[1], 0)), bool)
         ys, xs = self.cellCenters(win)
         return win, shapely.contains_xy(g, xs, ys)
 
