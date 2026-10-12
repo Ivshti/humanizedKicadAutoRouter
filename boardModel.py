@@ -6,6 +6,7 @@ stack order: 0 F.Cu, 1 In1.Cu, 2 In2.Cu, 3 B.Cu.
 import fnmatch
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 import pcbnew
@@ -76,6 +77,7 @@ class Model:
     minHoleClearance: float
     minHoleToHole: float
     edgeClearance: float
+    planes: dict = field(default_factory=dict)  # plane net -> inner copper (shapely), None = whole board
 
 
 def polySetToShapely(sps):
@@ -189,10 +191,57 @@ def zoneToKeepout(z):
                    z.GetDoNotAllowZoneFills())
 
 
-def ripCopper(board):
-    """Remove every track, via and copper zone; rule areas stay (they are design intent)."""
+INNER_KICAD = (pcbnew.In1_Cu, pcbnew.In2_Cu)
+
+
+def ripCopper(board, keep=()):
+    """Remove every track, via and copper zone except the zones in `keep`; rule areas stay
+    (they are design intent)."""
     for t in list(board.GetTracks()):
         board.Delete(t)
+    keep = {z.m_Uuid.AsString() for z in keep}  # wrappers differ per call, uuids do not
     for z in [board.GetArea(i) for i in range(board.GetAreaCount())]:
-        if not z.GetIsRuleArea():
+        if not z.GetIsRuleArea() and z.m_Uuid.AsString() not in keep:
             board.Delete(z)
+
+
+def boardPlanes(board):
+    """The board's own planes: its copper zones on the inner layers (teardrops are not
+    planes). They are kept as the designer drew them; everything else is routed afresh."""
+    zones = [board.GetArea(i) for i in range(board.GetAreaCount())]
+    return [z for z in zones if not z.GetIsRuleArea() and not z.IsTeardropArea()
+            and z.GetNetname() and any(z.IsOnLayer(l) for l in INNER_KICAD)]
+
+
+def innerPlaneFills(board, zones, outline):
+    """{net: inner copper of that net's planes} filled on the ripped board (pads and holes
+    only); a plane that covers the board is None."""
+    pcbnew.ZONE_FILLER(board).Fill(board.Zones())  # on the ripped board: these and rule areas
+    fills = {}
+    for z in zones:
+        for l in INNER_KICAD:
+            if not z.IsOnLayer(l):
+                continue
+            fill = polySetToShapely(z.GetFilledPolysList(l))
+            if fill is not None:
+                net = z.GetNetname()
+                fills[net] = fill if net not in fills else fills[net].union(fill)
+    return {net: (None if f.area >= 0.9 * outline.area else f) for net, f in fills.items()}
+
+
+def readSkewRules(druPath):
+    """Skew budgets from a .kicad_dru: [(diff-pair name pattern, max mm)] from rules with
+    `A.inDiffPair('pattern')` conditions and a `(constraint skew (max X))`."""
+    if not os.path.exists(druPath):
+        return []
+    with open(druPath) as f:
+        text = f.read()
+    out = []
+    for rule in re.split(r"\(rule\s", text)[1:]:
+        m = re.search(r"\(constraint\s+skew\s+\(max\s+([\d.]+)\s*(mm|mil)?\)", rule)
+        if not m:
+            continue
+        mm = float(m.group(1)) * (0.0254 if m.group(2) == "mil" else 1.0)
+        for pat in re.findall(r"inDiffPair\('([^']+)'\)", rule):
+            out.append((pat, mm))
+    return out

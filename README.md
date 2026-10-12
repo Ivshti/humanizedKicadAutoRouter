@@ -69,7 +69,7 @@ Options:
 | `--out DIR` | where the routed copy goes (required) |
 | `--flows FILE` | how much current each power net carries; see below |
 | `--minutes N` | time budget, default 25; it stops negotiating when this runs out |
-| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=2.5`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py` |
+| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=3`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py`. Useful ones: `viaMm` (what a via costs, in mm of track; 5), `topDiagonal` (`/`, `\` or `auto`), `pairSkewMm` |
 
 Progress is printed as it goes. The last line is the DRC result, for example
 `DRC: 0 violations {}, 0 unconnected`.
@@ -127,12 +127,19 @@ check the following.
    widths, clearances and via sizes, and the net-class patterns all come from
    it. A `.kicad_dru` with custom rules is copied along and is honoured by the
    final DRC.
-3. **A 4-layer stack-up.** Layers are outer top, two inner, outer bottom. Both
-   inner layers become solid ground; signals and power stay on the outer
-   layers.
-4. **Ground is the net called `GND`.** It gets fanout vias, the planes, the
-   pours and a stitching via field.
-5. **Net class names it recognises:**
+3. **A 4-layer stack-up.** Layers are outer top, two inner, outer bottom.
+   Signals and power are routed on the outer layers only.
+4. **Planes.** Copper zones you have drawn on the inner layers are kept exactly
+   as they are: a solid ground plane, or a ground plane with a power pour on
+   the other inner layer, for example. Pads of a plane's net over the plane get
+   a fanout via to it; pads outside a partial plane are wired to the net like
+   any other. If the board has no inner zones, both inner layers become solid
+   ground. Zones on the outer layers are removed with the rest of the copper
+   and poured again as ground; a power pour you had there comes back as
+   overlapping wide tracks (step 9 below).
+5. **Ground is the net called `GND`.** It gets the outer pours, return vias and
+   the stitching via field.
+6. **Net class names it recognises:**
 
    | net class | treated as |
    |---|---|
@@ -142,22 +149,29 @@ check the following.
    | `Default` | signal, at 0.2 mm |
    | any other class | signal, at that class's track width |
 
-   To use other names, rename your classes or edit the names in `router.py`
-   (`powerWidth`) and `strategy.py`.
-6. **Keep-out areas** you have drawn (board-level or inside footprints) are
+   A board with no `Power` or `Rail` class still gets its rails routed as
+   power: a net in the default class whose name is a voltage or a rail
+   (`+5V`, `V3_3`, `VBAT`, `VBUS_C`, `M2_3v3`, `VCC_IO`) is treated as `Rail`.
+   Control lines named after a rail (`VBUS_EN`, `PWR_FAIL`, `BAT_DET`) stay
+   signals. To use other class names, rename your classes or edit
+   `powerWidth` in `router.py`.
+7. **Keep-out areas** you have drawn (board-level or inside footprints) are
    obeyed.
-7. **Antennas:** a footprint whose reference starts with `ANT` owns its whole
+8. **Antennas:** a footprint whose reference starts with `ANT` owns its whole
    courtyard on its side of the board. No other copper goes under it.
-8. **Big modules and connectors** (courtyard of 40 mm² or more): no foreign
+9. **Big modules and connectors** (courtyard of 40 mm² or more): no foreign
    copper goes under their bodies on their side. Their own pins can still
    escape outward.
-9. **Fiducials (`FID…`) and mounting holes (`H…`)** are left alone.
-10. **Differential pairs** are found by name: `X_DP`/`X_DN`, `X_P`/`X_N`,
+10. **Fiducials (`FID…`) and mounting holes (`H…`)** are left alone.
+11. **Differential pairs** are found by name: `X_DP`/`X_DN`, `X_P`/`X_N`,
     `X+`/`X-`, and `CANH`/`CANL`. The pair gap is the net class's diff-pair
-    gap from the `.kicad_pro`.
+    gap from the `.kicad_pro`. Their lengths are matched to the skew budget
+    of a `(constraint skew (max …))` rule in the `.kicad_dru` whose condition
+    names the pair with `A.inDiffPair('…')`; a pair without such a rule is
+    matched to 0.5 mm (`--knob pairSkewMm=…`).
 
-Any existing tracks, vias and copper pours are removed before routing. The
-router always starts from a clean board.
+Any existing tracks, vias and outer-layer copper pours are removed before
+routing. The router always starts from a clean board, plus your inner planes.
 
 ---
 
@@ -212,12 +226,16 @@ It follows the order a person uses:
    parts sit on. Each ground pad gets its fanout via to the plane.
 4. **Power.** Biggest current first, as trunks from source to consumers.
    High-current paths avoid changing layers.
-5. **Plan corridors.** With the blocks and power down, it decides where each
-   bundle will run and on which layer, on a coarse map of the space that is
-   left:
-   - The bottom is the long-distance layer, as on a hand-routed board. A bundle
-     escapes its pins on the top, drops to the bottom close to them, travels
-     there and comes back up near its far end. Only short bundles stay on top.
+5. **Pick each layer's direction, then plan corridors.** Before the first
+   track, it decides which diagonal the top layer's long runs follow and gives
+   the bottom the other one, so the two layers run crosswise and long buses
+   can live on either. Every bundle is planned both ways on the empty board
+   and the cheaper assignment wins (`--knob topDiagonal=/` or `\` to set it
+   yourself). Then, with the blocks and power down, it decides where each
+   bundle will run and on which layer, on a coarse map of the space left:
+   - Running along the other layer's diagonal costs extra, so a bundle picks
+     the layer whose direction suits it and changes layer only where its path
+     turns the other way.
    - Bundles that can share a channel are drawn into it, side by side.
    - A bundle that would cross other wiring on the same layer is sent to the
      other layer instead, because every such crossing costs a pair of vias.
@@ -233,19 +251,26 @@ It follows the order a person uses:
 8. **Tidy up.** The worst detours are re-routed against the finished board.
    Then every route with vias is retried with vias priced much higher. A new
    route is kept only if it is better.
-9. **Power copper.** Every power track is widened to the widest that fits, so
-   neighbouring tracks of one net overlap into a small pour, the way a person
-   lays overlapping thick tracks. A track that ends on a pad grows no wider
-   than that pad. Long low-current power runs travel on the bottom.
-10. **Return vias.** Every signal via without a ground via within 1.5 mm gets
+9. **Length matching.** The shorter net of each differential pair gets
+   serpentines on its longest straight runs until the pair is within its skew
+   budget. Each bump is checked against the finished board before it is
+   placed, so a pair in a tight spot may end up matched less closely.
+10. **Power copper.** Every power track is widened to the widest that fits, so
+    neighbouring tracks of one net overlap into a small pour, the way a person
+    lays overlapping thick tracks. A track that ends on a pad grows no wider
+    than that pad.
+11. **Return vias.** Every signal via without a ground via within 1.5 mm gets
     one beside it, so the return current can change planes where the signal
     changes layers.
-11. **Planes and stitching.** Ground is poured on all four layers and stitched
-    with a via grid. A piece of the outer pour that nothing connects would be
-    removed and leave a hole in the ground; each one with room for a via gets
-    one. A ground pad whose thermal spokes end up blocked is given a solid
-    connection.
-12. **Check.** KiCad's DRC runs on the saved board and its result is reported.
+12. **Planes and stitching.** Ground is poured on the outer layers (and on the
+    inner ones when the board has no planes of its own) and stitched with a
+    via grid. A piece of the outer pour that nothing connects would be removed
+    and leave a hole in the ground; each one with room for a via gets one. A
+    ground pad whose thermal spokes end up blocked is given a solid connection.
+13. **Check and repair.** KiCad's DRC runs on the saved board. A ground pad
+    that the pour could not reach is then given a fanout via after all, pushing
+    other wiring aside, and the board is written and checked again. The last
+    DRC result is what is reported.
 
 Throughout, signal tracks are drawn to run one clearance away from existing
 wiring. Tracks pack together the way a person nudges them, and the space left
@@ -257,7 +282,7 @@ All tracks are horizontal, vertical or 45°.
 
 ## House rules it follows
 
-- Inner layers carry nothing but ground.
+- Inner layers carry nothing but your planes (ground, if you drew none).
 - No copper of another net under the antenna or under module and connector
   bodies on their side.
 - No via touches any SMD pad.
@@ -304,12 +329,17 @@ Numbers are from the reference board, compared with the same board routed by han
   down but are still several times the hand-routed count.
 - **Differential pairs** are coupled where there is room, and pairs that end
   up apart are re-routed together. On the reference board USB comes out about
-  two-thirds coupled, like the hand-routed board. The long CAN pair varies
-  from run to run (20–85%). Lengths are not matched.
-- **4-layer boards with a `GND` net only.** Other stack-ups and plane nets
-  need small changes.
+  half to two-thirds coupled, like the hand-routed board. The long CAN pair
+  varies from run to run (20–55%). Lengths are matched by serpentines; a pair
+  with no straight run left to bend can stay a millimetre or two apart.
+- **4-layer boards with a `GND` net.** Two-layer and six-layer boards need
+  changes.
 - **Run time** is 6–10 minutes on the reference board. Most of it is push and
   shove, and it depends on how crowded the board is.
+- **Memory.** Everything is rasterised at 0.025 mm over the whole board, so
+  memory grows with board area: about 2.2 GB peak on the 88 × 70 mm reference
+  board, roughly four times that on a 133 × 81 mm one. Route one board at a
+  time.
 - **Runs are not deterministic.** Most of the variation comes from push and
   shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left

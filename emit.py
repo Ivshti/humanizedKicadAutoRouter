@@ -66,8 +66,10 @@ def floatingIslands(board, layer, net, anchors):
 def addPlanes(board, outline, planes, removeIslands=True):
     """planes: [(layerIndex, netName, thermal)] covering the whole board outline."""
     nets = board.GetNetsByName()
+    added = []
     for layer, net, thermal in planes:
         z = pcbnew.ZONE(board)
+        added.append(z)
         z.SetLayer(KICAD_LAYERS[layer])
         z.SetNetCode(nets[net].GetNetCode())
         o = z.Outline()
@@ -83,6 +85,7 @@ def addPlanes(board, outline, planes, removeIslands=True):
                                else pcbnew.ISLAND_REMOVAL_MODE_NEVER)
         board.Add(z)
     pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+    return added
 
 
 def runDrc(boardPath, outJson):

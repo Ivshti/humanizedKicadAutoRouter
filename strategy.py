@@ -11,7 +11,6 @@
 import math
 from collections import defaultdict
 
-from boardModel import B
 from router import Conn
 
 PASSIVE_MAX_PADS = 4
@@ -181,15 +180,18 @@ def plan(model, router, log=print, flows=()):
         if len(pads) < 2 and net not in planeNets:
             continue
         cls = model.netClass.get(net, "Default")
-        if net in planeNets:
-            for p in pads:
-                if p.smd:
-                    add(net=net, a=p, b=None, kind="gnd", block=block[p.ref], prefLayer=p.side,
-                        strict=False)
-            continue
-        kind = "rf" if cls == "RF50" else ("pwr" if cls in ("Power", "Rail") else "sig")
+        kind = "rf" if cls == "RF50" else ("pwr" if router.powerClass(net) else "sig")
         netFlows = [f for f in flows if f["net"] == net]
         edges = powerEdges(pads, netFlows) if netFlows else [(a, b, d, 0.0) for a, b, d in mstEdges(pads)]
+        if net in planeNets:
+            # pads over the plane each get a fanout via; pads it does not reach (a plane
+            # that covers part of the board) are wired to the nearest pad of the net
+            over = {p.pid for p in pads if router.onPlane(net, p.center)}
+            for p in pads:
+                if p.smd and p.pid in over:
+                    add(net=net, a=p, b=None, kind="gnd", block=block[p.ref], prefLayer=p.side,
+                        strict=False)
+            edges = [e for e in edges if e[0].pid not in over or e[1].pid not in over]
         for a, b, d, amps in edges:
             ba, bb = block[a.ref], block[b.ref]
             c = add(net=net, a=a, b=b, kind=kind, block=ba if ba == bb else "")
@@ -206,12 +208,9 @@ def plan(model, router, log=print, flows=()):
         if c.bundle and c.kind == "sig":
             bundles[c.bundle].append(c)
     for c in conns:
-        if (c.kind == "pwr" or (c.kind == "sig" and not c.bundle)) and c.order > LONG_MM and c.amps <= 1.0:
-            # long runs travel on the bottom, like on a hand-routed board; high-current
-            # trunks stay on one layer instead
-            c.prefLayer = B
-        elif c.kind in ("sig", "pwr") and c.prefLayer < 0:
-            # block internals stay on the side their parts sit on
+        if c.kind in ("sig", "pwr") and c.prefLayer < 0 and c.order <= LONG_MM:
+            # block internals stay on the side their parts sit on; long runs pick the
+            # layer whose main diagonal suits them (router.mainAxis)
             c.prefLayer = c.a.side if c.a.side == c.b.side else -1
     nPairs = linkPairs(conns, pairPartners(set(model.nets)))
     log(f"plan: {len(conns)} connections, {len(set(block.values()))} blocks, {len(bundles)} bundles, "

@@ -6,6 +6,8 @@
 // Turns: 45 deg costs turn45, 90 deg costs turn90, sharper turns are not allowed.
 // dirCost (optional, 4 floats per cell): extra cost of entering a cell along each axis
 // (0 horizontal, 1 diagonal \, 2 vertical, 3 diagonal /), e.g. for crossing other wiring.
+// layerDir (optional, 4 floats per layer): extra cost per unit of length along each axis on
+// each layer, e.g. a layer's main routing direction.
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -63,7 +65,7 @@ int astar(int L, int H, int W, const float *cost, const uint8_t *viaok, float vi
           const uint8_t *target, const uint8_t *tvia, const int32_t *src, int nsrc,
           float turn45, float turn90, float hweight, int tx0, int ty0, int tx1, int ty1,
           int32_t *outPath, int maxPath, int64_t maxExpand, int64_t *expandedOut,
-          const float *dirCost, float viaCostFar) {
+          const float *dirCost, float viaCostFar, const float *layerDir) {
   const int64_t plane = (int64_t)H * W;
   const int64_t N = plane * L;
   const int32_t TERM = (int32_t)N;  // pseudo node: terminal via
@@ -112,6 +114,7 @@ int astar(int L, int H, int W, const float *cost, const uint8_t *viaok, float vi
       float step = (d & 1) ? 1.41421356f : 1.0f;
       float ng = gn + step * 0.5f * (c + cost[n]) + tc;
       if (dirCost) ng += dirCost[(int64_t)m * 4 + (d & 3)];
+      if (layerDir) ng += step * layerDir[l * 4 + (d & 3)];
       if (ng < g[m]) {
         g[m] = ng;
         par[m] = n;

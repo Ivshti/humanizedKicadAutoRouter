@@ -8,6 +8,7 @@ routes it crossed; they go back on the queue.
 """
 import ctypes
 import math
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -32,7 +33,7 @@ class Knobs:
     powerWidth: dict = field(default_factory=lambda: {"Power": 0.5, "Rail": 0.3})
     turn45Mm: float = 0.1
     turn90Mm: float = 0.5
-    viaMm: float = 3.0
+    viaMm: float = 5.0
     otherLayerMult: float = 2.5
     neckMm: float = 1.0          # power tracks may neck down this close to their own pads
     escapeMm: float = 1.5        # body keep-outs do not apply this close to the route's own pads
@@ -54,12 +55,30 @@ class Knobs:
     corridorTileMm: float = 2.0
     corridorOut: float = 3.0     # bundle members pay this much more outside their corridor
     corridorViaMm: float = 4.0   # what a layer change costs a corridor, per member
-    corridorTopMult: float = 1.8 # travelling on the top costs this much more than the bottom
+    againstCost: float = 0.6     # running along the diagonal that is the other layer's main
+                                 # direction costs this much more per mm
+    pairSkewMm: float = 0.5      # length mismatch allowed in a differential pair that the
+                                 # design rules (.kicad_dru skew) say nothing about
+    topDiagonal: str = "auto"    # the top layer's main diagonal: "/", "\\" or "auto" (planned)
     corridorShare: float = 0.75  # a corridor tile another group runs through, while it has room
     viaCleanupMult: float = 4.0  # the last cleanup pass prices vias this much higher
     joinMm: float = 6.0          # bundle members whose ends are this close share a corridor
     maxGroup: int = 6
     maxExpand: int = 30_000_000
+
+
+# a power rail by name, for boards whose net classes do not say: a voltage (5V, 3V3,
+# +3.3v, V1_8, V12) or a rail word (VCC, VDD, VBAT, VBUS, VIN, VSYS), but not the
+# control lines named after a rail (VBUS_EN, PWR_FAIL, BAT_DET)
+RAIL_NAME = re.compile(r"(^|[_+])(\d+(\.\d+)?V\d*|V\d+(_\d+)?|VCC\w*|VDD\w*|AVDD|DVDD|VBAT|VBUS\w*|"
+                       r"VIN|VSYS|VREG|BAT_?P)($|_)", re.I)
+RAIL_CONTROL = re.compile(r"(^|_)(EN|DET|SENSE|SNS|FB|PG|GOOD|OK|FAIL|BUT|KEY|ARM|OFF|ON|INT|CTRL|"
+                          r"CC\d?|ID|ADC|MON|SEL)($|_)", re.I)
+
+
+def railByName(net):
+    leaf = net.rsplit("/", 1)[-1]
+    return bool(RAIL_NAME.search(leaf)) and not RAIL_CONTROL.search(leaf)
 
 
 def padMinDim(pad):
@@ -127,25 +146,42 @@ class Router:
         self.sp.defaultClearance = dc
         self.netId = {n: i + 1 for i, n in enumerate(sorted(model.netClass))}
         self.netName = {i: n for n, i in self.netId.items()}
+        self.planeNets = set(model.planes) or {"GND"}
+        self.hasPowerClasses = any(c in self.k.powerWidth for c in model.netClass.values())
         self.rules = {n: self.ruleFor(n) for n in model.netClass}
         self.routes = {}
         self.nextRid = 1
         self.children = {}
         self.netItems = {}
-        self.planeNets = {"GND"}
         self.flowNets = set()      # power nets whose current is planned from flows
         self.hist = np.zeros((NLAYERS, self.sp.H, self.sp.W), np.float32)
         self.stats = {"searches": 0, "searchS": 0.0, "costS": 0.0, "commitS": 0.0}
         self.corridors = None      # Corridors planner, once the bundle phase starts
+        # each outer layer's main diagonal (corridors.py axis numbering); the other diagonal
+        # costs extra on it, so the two layers run their long wiring crosswise
+        self.mainAxis = {F: 3, B: 1}
         self.loadFixed()
 
     # ---- setup ------------------------------------------------------------------------
+    def powerClass(self, net):
+        """The power width class of a net (a key of Knobs.powerWidth), or None for a signal.
+        A net class named Power or Rail says so; on a board without them, a net in the
+        default class whose name is a rail's is routed as a Rail."""
+        cls = self.m.netClass.get(net, "Default")
+        if cls in self.k.powerWidth:
+            return cls
+        if cls == "Default" and not self.hasPowerClasses and net not in self.planeNets \
+                and railByName(net):
+            return "Rail"
+        return None
+
     def ruleFor(self, net):
         cls = self.m.netClass.get(net, "Default")
         nc = self.m.classes[cls]
-        if cls in self.k.powerWidth:
+        pc = self.powerClass(net)
+        if pc:
             # power may neck to signal width at its pins (fine-pitch regulators)
-            w, narrow = self.k.powerWidth[cls], min(nc.width, self.k.signalWidth)
+            w, narrow = max(self.k.powerWidth[pc], nc.width), min(nc.width, self.k.signalWidth)
         elif cls == "Default":
             w, narrow = self.k.signalWidth, nc.width
         else:
@@ -256,7 +292,7 @@ class Router:
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
             self.bodyViaKeep[i0:i1, j0:j1] |= mask
         self.thermalCost = np.zeros((NLAYERS, sp.H, sp.W), np.float32)
-        for pad in self.m.nets.get("GND", []):
+        for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
             if not pad.smd:
                 continue
             minx, miny, maxx, maxy = pad.poly.bounds
@@ -272,6 +308,18 @@ class Router:
                     if l in (F, B):
                         self.thermalCost[l, i0:i1, j0:j1][mask] = k.thermalPenalty
         self.holeDist = (edt(sp.holeMask) * sp.g).astype(np.float32)
+        # a plane that does not cover the board: cells where a via reaches it
+        self.planeCells = {}
+        for net, fill in self.m.planes.items():
+            if fill is None or net not in self.netId:
+                continue
+            cells = np.zeros((sp.H, sp.W), bool)
+            rule = self.rules[net]
+            win, mask = sp.rasterMask(fill.buffer(-(rule.viaDia / 2 + rule.clearance)))
+            if mask.size:
+                i0, j0, i1, j1 = win
+                cells[i0:i1, j0:j1] |= mask
+            self.planeCells[net] = cells
 
     # ---- connectivity ------------------------------------------------------------------
     def nodeOf(self, item):
@@ -297,7 +345,7 @@ class Router:
 
         for pad in self.m.nets.get(net, []):
             find(("pad", pad.pid))
-            if net in self.planeNets and not pad.smd:
+            if net in self.planeNets and not pad.smd and self.onPlane(net, pad.center):
                 union(("pad", pad.pid), ("plane", net))
         for r in self.routes.values():
             if r.conn.net != net:
@@ -305,6 +353,11 @@ class Router:
             for n in r.nodes:
                 union(("route", r.rid), n)
         return find
+
+    def onPlane(self, net, p):
+        """Whether the net's plane has copper under point p."""
+        fill = self.m.planes.get(net)
+        return fill is None or fill.contains(Point(p))
 
     def connected(self, conn):
         find = self.components(conn.net)
@@ -580,6 +633,9 @@ class Router:
         srcIdx = np.flatnonzero(src).astype(np.int32)
         tgt = dst.astype(np.uint8)
         tvia = viaok.copy() if toPlane else None
+        if tvia is not None and conn.net in self.planeCells:
+            i0, j0, i1, j1 = win
+            tvia &= self.planeCells[conn.net][i0:i1, j0:j1]
         vCost = (viaMm if viaMm is not None else k.viaMm) / k.grid
         ys, xs = np.nonzero(dst.any(axis=0)) if dst.any() else (np.array([0]), np.array([0]))
         tx0, tx1, ty0, ty1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
@@ -591,6 +647,7 @@ class Router:
         # search runs straight past discounted (hugging, pair-following) paths
         free = cost[cost > 0]
         hweight = k.hweight * max(min(1.0, float(free.min()) if free.size else 1.0), k.minHeuristic)
+        layerDir = self.layerDir(layers) if conn.kind in ("sig", "pwr") else None
         t0 = time.perf_counter()
         n = self.kernel.astar(Ls, h, w, cost.ctypes.data, viaok.ctypes.data, ctypes.c_float(vCost),
                               tgt.ctypes.data, tvia.ctypes.data if tvia is not None else None,
@@ -599,7 +656,8 @@ class Router:
                               ctypes.c_float(0.0 if toPlane else hweight),
                               tx0, ty0, tx1, ty1, outPath.ctypes.data, len(outPath),
                               ctypes.c_int64(k.maxExpand), ctypes.byref(expanded), None,
-                              ctypes.c_float(vCost * k.farViaMult))
+                              ctypes.c_float(vCost * k.farViaMult),
+                              layerDir.ctypes.data if layerDir is not None else None)
         self.stats["searches"] += 1
         self.stats["searchS"] += time.perf_counter() - t0
         if n <= 0:
@@ -615,6 +673,15 @@ class Router:
             cells.append((layers[li], i + win[0], j + win[1], bool(wideOk[li, i, j])))
         return dict(cells=cells, terminalVia=terminalVia, srcItems=srcItems, dstItems=dstItems,
                     rule=rule, win=win)
+
+    def layerDir(self, layers):
+        """Extra cost per unit length along each axis, per search layer: the diagonal that
+        is the other outer layer's main direction."""
+        out = np.zeros((len(layers), 4), np.float32)
+        for li, l in enumerate(layers):
+            if l in self.mainAxis:
+                out[li, 4 - self.mainAxis[l]] = self.k.againstCost
+        return out
 
     # ---- geometry ----------------------------------------------------------------------
     def pathToGeometry(self, conn, res):
@@ -906,6 +973,115 @@ class Router:
         for r in old:
             self.restore(r)
         return False
+
+    # ---- length matching ----------------------------------------------------------------
+    def netLength(self, net):
+        nid = self.netId[net]
+        return sum(math.dist(*self.sp.items[i].pts) for i in self.netItems.get(nid, ())
+                   if self.sp.items[i].kind == "track")
+
+    @staticmethod
+    def serpentine(p, q, w, side, extra, amax, pitch):
+        """The run p->q with rectangular bumps (45 deg corners) to one side that add up to
+        `extra` mm of length, at most `amax` high. Returns (points, mm added), or None when
+        the run is too short or the extra too small for one bump."""
+        L = math.dist(p, q)
+        if L < 1e-6:
+            return None
+        u = ((q[0] - p[0]) / L, (q[1] - p[1]) / L)
+        n = (-u[1] * side, u[0] * side)
+        c0 = w                                  # corner chamfer
+        lost = (8 - 4 * math.sqrt(2)) * c0      # what the chamfers take off 2 * amplitude
+        adv = 4 * c0 + pitch                    # run length one bump spans
+        margin = max(2 * w, 0.3)
+        fit = int((L - 2 * margin + pitch) // (adv + pitch))
+        if fit < 1 or extra < 4 * c0 - lost or amax < 2 * c0:
+            return None
+        nb = min(fit, math.ceil(extra / (2 * amax - lost)))
+        A = max(2 * c0, min(amax, (extra / nb + lost) / 2))
+        gain = nb * (2 * A - lost)
+        span = nb * adv + (nb - 1) * pitch
+        x = (L - span) / 2
+        at = lambda a, b: (p[0] + u[0] * a + n[0] * b, p[1] + u[1] * a + n[1] * b)
+        pts = [p]
+        for _ in range(nb):
+            pts += [at(x, 0), at(x + c0, c0), at(x + c0, A - c0), at(x + 2 * c0, A),
+                    at(x + 2 * c0 + pitch, A), at(x + 3 * c0 + pitch, A - c0),
+                    at(x + 3 * c0 + pitch, c0), at(x + adv, 0)]
+            x += adv + pitch
+        pts.append(q)
+        return pts, gain
+
+    def lengthen(self, conn, extra, amax):
+        """Add about `extra` mm to a routed connection with serpentines on its longest
+        straight runs, each one verified exactly before it replaces the run. Returns the
+        length added."""
+        r = self.routes.get(conn.rid)
+        if r is None:
+            return 0.0
+        added = 0.0
+        tracks = sorted((self.sp.items[i] for i in r.items if self.sp.items[i].kind == "track"),
+                        key=lambda it: -math.dist(*it.pts))
+        for it in tracks:
+            want = extra - added
+            if want < 0.05:
+                break
+            pitch = max(3 * it.width, it.width + it.clearance)
+            done = False
+            for amp in (amax, amax * 0.6, amax * 0.35):
+                for side in (1, -1):
+                    res = self.serpentine(*it.pts, it.width, side, want, amp, pitch)
+                    if res is None:
+                        continue
+                    pts, gain = res
+                    layer = it.layers[0]
+                    new = [self.trackItem(conn.net, layer, a, b, it.width, it.clearance, r.rid)
+                           for a, b in zip(pts, pts[1:]) if a != b]
+                    if any(self.check(t, ignore={it.iid}) or self.underBody(t, layer) for t in new):
+                        continue
+                    self.sp.remove(it.iid)
+                    self.netItems[it.net].discard(it.iid)
+                    r.items.remove(it.iid)
+                    for t in new:
+                        self.sp.add(t)
+                        self.netItems[t.net].add(t.iid)
+                        r.items.append(t.iid)
+                    added += gain
+                    done = True
+                    break
+                if done:
+                    break
+        return added
+
+    def underBody(self, item, layer):
+        """Copper of a route that would sit under a module or antenna body."""
+        win, mask = self.sp.rasterMask(item.geom)
+        i0, j0, i1, j1 = win
+        return bool((self.bodyKeep[layer, i0:i1, j0:j1] & mask).any()) if mask.size else False
+
+    def matchPairs(self, partners, budgetFor, log):
+        """Differential pairs whose two nets differ in length by more than their skew
+        budget: the shorter net is lengthened with serpentines to match."""
+        for a, b in sorted(partners.items()):
+            if a > b or a not in self.netId or b not in self.netId:
+                continue
+            budget = budgetFor(a)
+            la, lb = self.netLength(a), self.netLength(b)
+            skew = abs(la - lb)
+            if skew <= budget * 0.5:
+                continue
+            short = a if la < lb else b
+            conns = sorted({id(rt.conn): rt.conn for rt in self.routes.values()
+                            if rt.conn.net == short and rt.conn.b is not None}.values(),
+                           key=lambda c: -self.routeCost(c.rid)[0])
+            added = 0.0
+            for c in conns:
+                if skew - added <= budget * 0.25:
+                    break
+                w = self.ruleForConn(c).width
+                added += self.lengthen(c, skew - added, max(1.0, 5 * w))
+            after = abs(self.netLength(a) - self.netLength(b))
+            log(f"length match {a}/{b}: skew {skew:.2f} -> {after:.2f} mm (budget {budget:.2f})")
 
     # ---- power copper ------------------------------------------------------------------
     def padUnder(self, net, layer, p):
