@@ -338,8 +338,7 @@ Numbers are from the reference board, compared with the same board routed by han
   shove, and it depends on how crowded the board is.
 - **Memory.** Everything is rasterised at 0.025 mm over the whole board, so
   memory grows with board area: about 2.2 GB peak on the 88 × 70 mm reference
-  board, roughly four times that on a 133 × 81 mm one. Route one board at a
-  time.
+  board, about 3.2 GB on a 133 × 81 mm one. Route one board at a time.
 - **Runs are not deterministic.** Most of the variation comes from push and
   shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left
