@@ -91,8 +91,8 @@ class Corridors:
         keep-outs already on the board."""
         r, sp, k = self.r, self.r.sp, self.r.k
         rule = r.rules[next(n for n, c in r.m.netClass.items() if c == "Default")]
-        pitch = k.signalWidth + rule.clearance
-        need = k.signalWidth / 2 + rule.clearance + k.margin
+        pitch = rule.width + rule.clearance
+        need = rule.width / 2 + rule.clearance + k.margin
         cap = np.zeros((2, self.TH, self.TW), np.float32)
         for li, l in enumerate(LAYERS):
             blocked = (sp.occ[l] != 0) | r.bodyKeep[l] | sp.trackKeep[l]

@@ -8,6 +8,7 @@ routes it crossed; they go back on the queue.
 """
 import ctypes
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ CIRC = 1 / math.cos(math.pi / 64)
 class Knobs:
     grid: float = 0.025
     margin: float = 0.02
-    signalWidth: float = 0.2
+    signalWidth: float = 0.0     # signal track width; 0 = the board's Default net class width
     powerWidth: dict = field(default_factory=lambda: {"Power": 0.5, "Rail": 0.3})
     turn45Mm: float = 0.1
     turn90Mm: float = 0.5
@@ -57,11 +58,13 @@ class Knobs:
     corridorViaMm: float = 4.0   # what a layer change costs a corridor, per member
     againstCost: float = 0.6     # running along the diagonal that is the other layer's main
                                  # direction costs this much more per mm
-    pairSkewMm: float = 0.5      # length mismatch allowed in a differential pair that the
+    pairSkewMm: float = 1.5      # length mismatch allowed in a differential pair that the
                                  # design rules (.kicad_dru skew) say nothing about
     topDiagonal: str = "auto"    # the top layer's main diagonal: "/", "\\" or "auto" (planned)
     corridorShare: float = 0.75  # a corridor tile another group runs through, while it has room
     viaCleanupMult: float = 4.0  # the last cleanup pass prices vias this much higher
+    straightenMult: float = 4.0  # the straightening pass prices corners this much higher
+    pairStartMm: float = 1.2     # a pair may start this far from the midpoint of its two pads
     joinMm: float = 6.0          # bundle members whose ends are this close share a corridor
     maxGroup: int = 6
     maxExpand: int = 30_000_000
@@ -124,6 +127,7 @@ class Conn:
     groupPos: int = 0         # position across the group's width
     pairLeader: object = None # set on a pair's second net: the first net's connection
     pairMate: object = None   # both nets of a pair: the other one's connection
+    pairTried: bool = False   # the pair was already tried together (see Router.routePair)
 
 
 @dataclass
@@ -133,6 +137,7 @@ class Route:
     items: list
     nodes: list               # union-find nodes this route joins
     parents: set
+    paired: bool = False      # laid together with its differential partner
 
 
 class Router:
@@ -160,6 +165,7 @@ class Router:
         # each outer layer's main diagonal (corridors.py axis numbering); the other diagonal
         # costs extra on it, so the two layers run their long wiring crosswise
         self.mainAxis = {F: 3, B: 1}
+        self.asForeign = False     # while True, new track items belong to no net (see trackItem)
         self.loadFixed()
 
     # ---- setup ------------------------------------------------------------------------
@@ -175,15 +181,19 @@ class Router:
             return "Rail"
         return None
 
+    def signalWidth(self):
+        return self.k.signalWidth or self.m.classes["Default"].width
+
     def ruleFor(self, net):
         cls = self.m.netClass.get(net, "Default")
         nc = self.m.classes[cls]
         pc = self.powerClass(net)
+        sig = self.signalWidth()
         if pc:
             # power may neck to signal width at its pins (fine-pitch regulators)
-            w, narrow = max(self.k.powerWidth[pc], nc.width), min(nc.width, self.k.signalWidth)
+            w, narrow = max(self.k.powerWidth[pc], nc.width), min(nc.width, sig)
         elif cls == "Default":
-            w, narrow = self.k.signalWidth, nc.width
+            w, narrow = sig, nc.width
         else:
             w = narrow = nc.width
         return NetRule(w, min(narrow, w), nc.clearance, nc.viaDia, nc.viaDrill, cls)
@@ -374,9 +384,11 @@ class Router:
         return out
 
     # ---- cost raster -------------------------------------------------------------------
-    def buildCost(self, conn, rule, win, layers, srcItems, dstItems, negotiate, extraMargin):
+    def buildCost(self, conn, rule, win, layers, srcItems, dstItems, negotiate, extraMargin,
+                  ownNets=None, ownPads=None):
         sp, k, g = self.sp, self.k, self.k.grid
         nid = self.netId[conn.net]
+        nets = tuple(ownNets) if ownNets else (nid,)
         plane = conn.net in self.planeNets
         i0, j0, i1, j1 = win
         h, w = i1 - i0, j1 - j0
@@ -384,7 +396,8 @@ class Router:
         rW = rule.width / 2 + rule.clearance + m
         rN = rule.narrow / 2 + rule.clearance + m
         endPads = [it for it in srcItems + dstItems if it.kind == "pad"]
-        ownPads = [it for it in endPads if it.pad is conn.a or it.pad is conn.b]
+        if ownPads is None:
+            ownPads = [it for it in endPads if it.pad is conn.a or it.pad is conn.b]
         # escape zone: close to the pads this connection starts/ends on, body keep-outs
         # do not apply (a pin under a module must get out) and power may neck down
         own = np.zeros((h, w), bool)
@@ -398,13 +411,13 @@ class Router:
         cost = np.empty((len(layers), h, w), np.float32)
         wideOk = np.empty((len(layers), h, w), bool)
         for li, l in enumerate(layers):
-            dAll = sp.foreignDist(nid, l, win)
+            dAll = sp.foreignDist(nid, l, win, nets=nets)
             wideOk[li] = dAll >= rW
             ok = wideOk[li] | (neckZone & (dAll >= rN))
             soft = None
             if negotiate:
                 # routes in the way will be ripped: judge width against fixed copper only
-                dFix = sp.foreignDist(nid, l, win, fixedOnly=True)
+                dFix = sp.foreignDist(nid, l, win, fixedOnly=True, nets=nets)
                 okFix = (dFix >= rW) | (neckZone & (dFix >= rN))
                 soft = okFix & ~ok
                 ok = okFix
@@ -449,15 +462,15 @@ class Router:
                     view[sub & (view < 0)] = 1.0
         # vias
         rv = rule.viaDia / 2
-        dAny = sp.foreignDist(nid, None, win, fixedOnly=negotiate)
+        dAny = sp.foreignDist(nid, None, win, fixedOnly=negotiate, nets=nets)
         viaok = dAny >= rv + rule.clearance + m
         viaok &= ~sp.viaKeep[i0:i1, j0:j1]
         if not plane:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
         # one cell of raster slack: a pad corner can rasterise one cell short
-        viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: a == nid) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
+        viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: np.isin(a, nets)) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
         viaok &= self.holeDist[i0:i1, j0:j1] >= rule.viaDrill / 2 + self.m.minHoleToHole + m
-        viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: a == nid) >= \
+        viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: np.isin(a, nets)) >= \
             rule.viaDrill + self.m.minHoleToHole + m
         viaok = viaok.astype(np.uint8)
         # a bundle member or pair wants its vias at its escapes and planned layer changes
@@ -629,15 +642,25 @@ class Router:
         self.stats["costS"] += time.perf_counter() - t0
         if not src.any() or (not dst.any() and not toPlane):
             return None
-        Ls, h, w = cost.shape
         srcIdx = np.flatnonzero(src).astype(np.int32)
         tgt = dst.astype(np.uint8)
         tvia = viaok.copy() if toPlane else None
         if tvia is not None and conn.net in self.planeCells:
             i0, j0, i1, j1 = win
             tvia &= self.planeCells[conn.net][i0:i1, j0:j1]
+        cells, terminalVia = self.runKernel(conn, cost, viaok, wideOk, srcIdx, tgt, tvia, win, layers,
+                                            viaMm, toPlane)
+        if cells is None:
+            return None
+        return dict(cells=cells, terminalVia=terminalVia, srcItems=srcItems, dstItems=dstItems,
+                    rule=rule, win=win)
+
+    def runKernel(self, conn, cost, viaok, wideOk, srcIdx, tgt, tvia, win, layers, viaMm, toPlane):
+        """The A* call; returns (cells, terminalVia) or (None, False)."""
+        k = self.k
+        Ls, h, w = cost.shape
         vCost = (viaMm if viaMm is not None else k.viaMm) / k.grid
-        ys, xs = np.nonzero(dst.any(axis=0)) if dst.any() else (np.array([0]), np.array([0]))
+        ys, xs = np.nonzero(tgt.any(axis=0)) if tgt.any() else (np.array([0]), np.array([0]))
         tx0, tx1, ty0, ty1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
         maxPath = h * w * 2 + 16
         outPath = np.empty(min(maxPath, 4_000_000), np.int32)
@@ -661,7 +684,7 @@ class Router:
         self.stats["searches"] += 1
         self.stats["searchS"] += time.perf_counter() - t0
         if n <= 0:
-            return None
+            return None, False
         path = outPath[:n].tolist()
         terminalVia = path[-1] == -1
         if terminalVia:
@@ -671,8 +694,7 @@ class Router:
             li, rem = divmod(f, h * w)
             i, j = divmod(rem, w)
             cells.append((layers[li], i + win[0], j + win[1], bool(wideOk[li, i, j])))
-        return dict(cells=cells, terminalVia=terminalVia, srcItems=srcItems, dstItems=dstItems,
-                    rule=rule, win=win)
+        return cells, terminalVia
 
     def layerDir(self, layers):
         """Extra cost per unit length along each axis, per search layer: the diagonal that
@@ -719,8 +741,9 @@ class Router:
     def trackItem(self, net, layer, p1, p2, width, clearance, rid):
         r = width / 2 * CIRC
         geom = LineString([p1, p2]).buffer(r, 16) if p1 != p2 else Point(p1).buffer(r, 16)
-        return Item(0, self.netId[net], "track", (layer,), geom, clearance, width=width,
-                    pts=(p1, p2), route=rid)
+        # a pair's centreline is checked as nobody's copper: clear of both nets' pads
+        nid = -1 if self.asForeign else self.netId[net]
+        return Item(0, nid, "track", (layer,), geom, clearance, width=width, pts=(p1, p2), route=rid)
 
     def viaItem(self, net, p, rule, rid):
         geom = Point(p).buffer(rule.viaDia / 2 * CIRC, 16)
@@ -739,32 +762,79 @@ class Router:
             return True
         return abs(abs(dx) - abs(dy)) < 1e-6
 
+    @staticmethod
+    def legs(p, q):
+        """Ways to join p and q octilinearly: a direct segment when p->q is octilinear, else
+        the two L shapes (straight then diagonal, diagonal then straight), each given as the
+        corner point."""
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        adx, ady = abs(dx), abs(dy)
+        if adx < 1e-6 or ady < 1e-6 or abs(adx - ady) < 1e-6:
+            return [None]
+        sx, sy = (1 if dx > 0 else -1), (1 if dy > 0 else -1)
+        if adx > ady:
+            run = adx - ady
+            return [(p[0] + sx * run, p[1]), (q[0] - sx * run, q[1])]
+        run = ady - adx
+        return [(p[0], p[1] + sy * run), (q[0], q[1] - sy * run)]
+
+    @staticmethod
+    def heading(p, q):
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        return (0 if abs(dx) < 1e-6 else (1 if dx > 0 else -1),
+                0 if abs(dy) < 1e-6 else (1 if dy > 0 else -1))
+
     def segOk(self, conn, layer, p, q, width, rule):
         it = self.trackItem(conn.net, layer, p, q, width, rule.clearance, 0)
         return not self.check(it)
 
-    def pullTight(self, conn, layer, pts, wide, rule):
-        """Greedy string pulling with octilinear shortcuts that pass the exact check at the
-        width the segment will have. Only stretches the raster planned as necks may narrow."""
-        def width(k0, k1):
-            if all(wide[k0:k1 + 1]):
-                return rule.width
-            return self.pickWidth(conn, layer, pts[k0], pts[k1], rule)
+    def pathOk(self, conn, layer, pts, width, rule):
+        return all(a == b or self.segOk(conn, layer, a, b, width, rule) for a, b in zip(pts, pts[1:]))
+
+    def pullTight(self, conn, layer, pts, wide, rule, before=None, after=None, onTrack=(False, False)):
+        """Greedy string pulling with octilinear shortcuts, straight or L-shaped, that pass
+        the exact check at the width the segment will have. Only stretches the raster
+        planned as necks may narrow. `before`/`after`: the headings the run arrives with
+        and leaves in, so a shortcut's corner lands where a bend already is. `onTrack`:
+        whether the run's first / last point is a T junction on another track, where the
+        piece that meets it must not be shorter than MIN_LEG."""
+        def width(a, b, wideHere):
+            return rule.width if wideHere else self.pickWidth(conn, layer, a, b, rule)
         if len(pts) <= 2:
-            return pts, [width(0, len(pts) - 1)]
+            return pts, [width(pts[0], pts[-1], all(wide))]
         out, widths = [pts[0]], []
         kidx = 0
         while kidx < len(pts) - 1:
-            nxt = kidx + 1
+            nxt, chosen = kidx + 1, None
+            incoming = self.heading(out[-2], out[-1]) if len(out) > 1 else before
             for j in range(len(pts) - 1, kidx + 1, -1):
-                if not self.octilinear(pts[kidx], pts[j]):
-                    continue
-                wj = rule.width if all(wide[kidx:j + 1]) else rule.narrow
-                if self.segOk(conn, layer, pts[kidx], pts[j], wj, rule):
-                    nxt = j
+                wideHere = all(wide[kidx:j + 1])
+                wj = rule.width if wideHere else rule.narrow
+                outgoing = self.heading(pts[j], pts[j + 1]) if j + 1 < len(pts) else after
+                cands = []
+                for corner in self.legs(pts[kidx], pts[j]):
+                    path = [pts[kidx], pts[j]] if corner is None else [pts[kidx], corner, pts[j]]
+                    # prefer the L that continues the incoming heading or meets the outgoing one
+                    score = (0 if corner is None else 2)
+                    if corner is not None and self.heading(path[0], path[1]) == incoming:
+                        score -= 1
+                    if corner is not None and self.heading(path[1], path[2]) == outgoing:
+                        score -= 1
+                    cands.append((score, path))
+                for _, path in sorted(cands, key=lambda c: c[0]):
+                    if kidx == 0 and onTrack[0] and math.dist(path[0], path[1]) < self.MIN_LEG:
+                        continue
+                    if j == len(pts) - 1 and onTrack[1] and math.dist(path[-2], path[-1]) < self.MIN_LEG:
+                        continue
+                    if self.pathOk(conn, layer, path, wj, rule):
+                        chosen, nxt = (path, wideHere), j
+                        break
+                if chosen:
                     break
-            widths.append(width(kidx, nxt))
-            out.append(pts[nxt])
+            path, wideHere = chosen if chosen else ([pts[kidx], pts[nxt]], all(wide[kidx:nxt + 1]))
+            for a, b in zip(path, path[1:]):
+                widths.append(width(a, b, wideHere))
+                out.append(b)
             kidx = nxt
         return out, widths
 
@@ -781,29 +851,74 @@ class Router:
                 return wdt
         return rule.narrow
 
-    def entryPoint(self, conn, layer, p, items, rule):
-        """Extend a route end to the centre of the pad (or onto the centreline of a track)."""
+    MIN_LEG = 0.1   # mm; KiCad's connectivity ignores a shorter piece at a T junction
+
+    @staticmethod
+    def octilinearHits(p, a, b):
+        """Points of segment a-b that p reaches along one octilinear leg, nearest first."""
+        out = []
+        ax, ay = a
+        bx, by = b
+        dx, dy = bx - ax, by - ay
+        for hx, hy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            det = hx * (-dy) - hy * (-dx)
+            if abs(det) < 1e-9:
+                continue
+            # p + t*h = a + u*(b-a)
+            rx, ry = ax - p[0], ay - p[1]
+            t = (rx * (-dy) - ry * (-dx)) / det
+            u = (hx * ry - hy * rx) / det
+            if t >= 0 and -1e-9 <= u <= 1 + 1e-9:
+                out.append((t * math.hypot(hx, hy), (p[0] + t * hx, p[1] + t * hy)))
+        out.sort(key=lambda e: e[0])
+        return out
+
+    def entryLegs(self, conn, layer, p, items, rule):
+        """Points that take a route end on to the centre of its pad (or the centreline of
+        the track / the via it lands on), straight or with one bend, and the item it lands
+        on: (points, item). ([], None) when it lands on nothing."""
         for it in items:
             if layer not in it.layers or not it.geom.buffer(1e-3).contains(Point(p)):
                 continue
             if it.kind == "pad":
                 c = it.pad.center
-                if c != p and self.octilinear(p, c) and self.segOk(conn, layer, c, p, rule.narrow, rule):
-                    return c
-                return None
+                if c == p:
+                    return [], it
+                # the last leg along the pad's long axis, as a person draws it
+                minx, miny, maxx, maxy = it.pad.poly.bounds
+                axis = (1, 0) if maxx - minx >= maxy - miny else (0, 1)
+                best = []
+                for corner in self.legs(p, c):
+                    path = [p, c] if corner is None else [p, corner, c]
+                    if not self.pathOk(conn, layer, path, rule.narrow, rule):
+                        continue
+                    h = self.heading(path[-2], path[-1])
+                    along = (abs(h[0]), abs(h[1])) == axis
+                    if along or not best:
+                        best = path[1:]
+                    if along:
+                        break
+                return best, it
             if it.kind == "track":
-                ls = LineString(it.pts)
-                q = ls.interpolate(ls.project(Point(p)))
-                q = (q.x, q.y)
-                if q != p and self.segOk(conn, layer, q, p, rule.narrow, rule):
-                    return q
-                return None
+                # on to the centreline with one leg no shorter than KiCad needs; a point
+                # already inside the copper may stay where it is
+                inside = LineString(it.pts).distance(Point(p)) <= it.width / 2 - 1e-3
+                for d, q in self.octilinearHits(p, *it.pts):
+                    if d < self.MIN_LEG:
+                        continue
+                    if self.segOk(conn, layer, p, q, rule.narrow, rule):
+                        return [q], it
+                return [], it if inside else None
             if it.kind == "via":
-                c = it.pts[0]
-                if c != p and self.segOk(conn, layer, c, p, rule.narrow, rule):
-                    return c
-                return None
-        return None
+                q = it.pts[0]
+                if q == p:
+                    return [], it
+                for corner in self.legs(p, q):
+                    path = [p, q] if corner is None else [p, corner, q]
+                    if self.pathOk(conn, layer, path, rule.narrow, rule):
+                        return path[1:], it
+                return [], it
+        return [], None
 
     # ---- commit ------------------------------------------------------------------------
     def buildItems(self, conn, res, rid):
@@ -811,17 +926,24 @@ class Router:
         runs, vias = self.pathToGeometry(conn, res)
         items = []
         for ri, (layer, pts, wide) in enumerate(runs):
+            onTrack = [False, False]
             if ri == 0:
-                e = self.entryPoint(conn, layer, pts[0], res["srcItems"], rule)
-                if e is not None:
-                    pts = [e] + pts
-                    wide = [False] + wide
+                e, owner = self.entryLegs(conn, layer, pts[0], res["srcItems"], rule)
+                res["srcOwner"] = owner
+                onTrack[0] = owner is not None and owner.kind == "track"
+                pts = e[::-1] + pts
+                wide = [False] * len(e) + wide
             if ri == len(runs) - 1 and not res["terminalVia"]:
-                e = self.entryPoint(conn, layer, pts[-1], res["dstItems"], rule)
-                if e is not None:
-                    pts = pts + [e]
-                    wide = wide + [False]
-            pts, widths = self.pullTight(conn, layer, pts, wide, rule)
+                e, owner = self.entryLegs(conn, layer, pts[-1], res["dstItems"], rule)
+                res["dstOwner"] = owner
+                onTrack[1] = owner is not None and owner.kind == "track"
+                pts = pts + e
+                wide = wide + [False] * len(e)
+            raw = list(pts)
+            pts, widths = self.pullTight(conn, layer, pts, wide, rule, onTrack=onTrack)
+            if os.environ.get("HR_TRACE_NET") == conn.net:
+                self.log(f"trace {conn.net} {conn.a.ref}.{conn.a.num}->{conn.b.ref + '.' + conn.b.num if conn.b else 'plane'} "
+                         f"layer {layer} run {ri}: raw {raw} -> {pts} widths {widths}")
             for p, q, wdt in zip(pts, pts[1:], widths):
                 if p != q:
                     items.append(self.trackItem(conn.net, layer, p, q, wdt, rule.clearance, rid))
@@ -836,14 +958,16 @@ class Router:
         """Route ids / pad nodes the path starts and ends on."""
         sp = self.sp
         nodes, parents = [], set()
-        for cell, pool in ((res["cells"][0], res["srcItems"]), (res["cells"][-1], res["dstItems"])):
-            p = Point(sp.toMm(cell[1], cell[2]))
-            best = None
-            for it in pool:
-                if cell[0] in it.layers and it.geom.buffer(sp.g).contains(p):
-                    best = it
-                    if it.kind == "pad":
-                        break
+        for cell, pool, owner in ((res["cells"][0], res["srcItems"], res.get("srcOwner")),
+                                  (res["cells"][-1], res["dstItems"], res.get("dstOwner"))):
+            best = owner   # what the entry legs physically attached to
+            if best is None:
+                p = Point(sp.toMm(cell[1], cell[2]))
+                for it in pool:
+                    if cell[0] in it.layers and it.geom.buffer(sp.g).contains(p):
+                        best = it
+                        if it.kind == "pad":
+                            break
             if best is None:
                 continue
             nodes.append(self.nodeOf(best))
@@ -895,6 +1019,18 @@ class Router:
         nVia = sum(1 for it in items if it.kind == "via")
         return length + nVia * self.k.viaMm, nVia
 
+    def routeBends(self, rid):
+        """Corners in a route: points where two of its track pieces meet at an angle."""
+        ends = {}
+        for i in self.routes[rid].items:
+            it = self.sp.items[i]
+            if it.kind != "track":
+                continue
+            p, q = it.pts
+            ends.setdefault((it.layers[0], p), []).append(self.heading(p, q))
+            ends.setdefault((it.layers[0], q), []).append(self.heading(q, p))
+        return sum(1 for hs in ends.values() if len(hs) == 2 and hs[0] != (-hs[1][0], -hs[1][1]))
+
     def restore(self, old):
         """Put a ripped leaf route back exactly as it was."""
         ids = []
@@ -910,24 +1046,553 @@ class Router:
         old.conn.routed = True
         old.conn.rid = old.rid
 
-    def improve(self, rid, layers, winPads, viaMm):
+    def improve(self, rid, layers, winPads, viaMm, straighten=False):
         """Rip a leaf route and search again with everything else in place; keep the new one
-        only if it is shorter or uses fewer vias."""
+        only if it is shorter or uses fewer vias. `straighten`: search with bends priced
+        high, and also keep a route with fewer corners that is not longer."""
         r = self.routes.get(rid)
-        if r is None or self.children.get(rid):
+        if r is None or self.children.get(rid) or r.paired:
             return False
         before, viasBefore = self.routeCost(rid)
+        bendsBefore = self.routeBends(rid)
         r.oldItems = [self.sp.items[i] for i in r.items]
         self.rip(rid)
-        st, new = self.route(r.conn, layers, winPads, viaMm=viaMm)
+        turn = self.k.turn45Mm
+        if straighten:
+            self.k.turn45Mm = turn * self.k.straightenMult
+        try:
+            st, new = self.route(r.conn, layers, winPads, viaMm=viaMm)
+        finally:
+            self.k.turn45Mm = turn
         if st == "ok" and new is not None:
             after, viasAfter = self.routeCost(new.rid)
             if after < before - 0.3 or viasAfter < viasBefore:
                 return True
+            if straighten and viasAfter <= viasBefore and after <= before + 0.3 \
+                    and self.routeBends(new.rid) < bendsBefore:
+                return True
             self.rip(new.rid)
-        elif st == "ok":   # already connected some other way: nothing to put back
+        elif st == "ok" and self.nodesJoined(r):
+            # its two pads are joined some other way, and so is everything the route
+            # itself was holding together: nothing to put back
             return True
         self.restore(r)
+        return False
+
+    def nodesJoined(self, r):
+        """Whether the nodes a (ripped) route joined are still in one component."""
+        find = self.components(r.conn.net)
+        roots = {find(n) for n in r.nodes}
+        return len(roots) <= 1
+
+    def audit(self, log, phase):
+        """Track ends that touch nothing of their net, or only routes this route does not
+        record as parents (so a rip could strand it): bookkeeping errors."""
+        bad = 0
+        for rid, r in self.routes.items():
+            own = set(r.items)
+            for i in r.items:
+                it = self.sp.items[i]
+                if it.kind != "track":
+                    continue
+                for p in it.pts:
+                    touching = [o for o in self.sp.query(it.layers, (p[0], p[1], p[0], p[1]))
+                                if o.iid != it.iid and o.net == it.net and o.kind in ("pad", "track", "via")
+                                and o.geom.buffer(1e-3).contains(Point(p))]
+                    where = f"{r.conn.net} route {rid} ({r.conn.a.ref}.{r.conn.a.num}->" \
+                            f"{r.conn.b.ref + '.' + r.conn.b.num if r.conn.b else 'plane'}) end {p} layer {it.layers[0]}"
+                    if not touching:
+                        bad += 1
+                        log(f"audit {phase}: {where} touches nothing")
+                    elif not any((o.kind == "pad" and self.nodeOf(o) in r.nodes) or o.iid in own
+                                 or o.route in r.parents for o in touching):
+                        bad += 1
+                        log(f"audit {phase}: {where} touches only {sorted({(o.kind, o.route, o.tag) for o in touching})}; "
+                            f"nodes {r.nodes} parents {sorted(r.parents)}")
+        return bad
+
+    # ---- via tidying ---------------------------------------------------------------------
+    def swapItems(self, r, old, new):
+        """Replace some of a route's items with new ones (all of the route's net)."""
+        for it in old:
+            self.sp.remove(it.iid)
+            self.netItems[it.net].discard(it.iid)
+            r.items.remove(it.iid)
+        for it in new:
+            it.route = r.rid
+            self.sp.add(it)
+            self.netItems.setdefault(it.net, set()).add(it.iid)
+            r.items.append(it.iid)
+
+    def tracksAt(self, r, p, layer, skip=()):
+        out = []
+        for i in r.items:
+            it = self.sp.items[i]
+            if it.kind == "track" and layer in it.layers and i not in skip \
+                    and any(math.dist(q, p) < 1e-4 for q in it.pts):
+                out.append(it)
+        return out
+
+    def stubToPad(self, r, via, layer, maxLen):
+        """The route's tracks on `layer` from the via to a pad of its net, when they get
+        there in at most three pieces without branching and within maxLen mm."""
+        cur, chain, seen, length = via.pts[0], [], set(), 0.0
+        for _ in range(3):
+            ts = self.tracksAt(r, cur, layer, seen)
+            if len(ts) != 1:
+                return None
+            t = ts[0]
+            chain.append(t)
+            seen.add(t.iid)
+            length += math.dist(*t.pts)
+            if length > maxLen:
+                return None
+            cur = t.pts[1] if math.dist(t.pts[0], cur) < 1e-4 else t.pts[0]
+            pad = self.padUnder(r.conn.net, layer, cur)
+            if pad is not None:
+                return pad, chain, cur
+        return None
+
+    def tidyVias(self, maxLen=3.0):
+        """Vias a short stub away from a pad are moved so the stub leaves the pad's centre
+        in a straight line, as a person places them: along the pad's long axis first, then
+        any octilinear direction. Routes other routes hang off are left alone."""
+        moved = 0
+        for rid, r in list(self.routes.items()):
+            c = r.conn
+            if c.kind not in ("sig", "pwr") or c.b is None or self.children.get(rid) or r.paired:
+                continue
+            rule = self.ruleForConn(c)
+            for via in [self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via"]:
+                for layer in (F, B):
+                    st = self.stubToPad(r, via, layer, maxLen)
+                    if st is None:
+                        continue
+                    pad, chain, end = st
+                    ctr = pad.center
+                    v = via.pts[0]
+                    if len(chain) == 1 and math.dist(end, ctr) < 1e-4 and self.octilinear(ctr, v):
+                        continue
+                    other = B if layer == F else F
+                    tails = self.tracksAt(r, v, other)
+                    if any(len(self.tracksAt(r, v, other, {t.iid})) > 1 for t in tails):
+                        continue
+                    farEnds = [t.pts[1] if math.dist(t.pts[0], v) < 1e-4 else t.pts[0] for t in tails]
+                    oldPieces = len(chain) + len(tails)
+                    minx, miny, maxx, maxy = pad.poly.bounds
+                    axis = ((1, 0), (-1, 0)) if maxx - minx >= maxy - miny else ((0, 1), (0, -1))
+                    diag = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+                    cross = ((0, 1), (0, -1)) if axis[0] == (1, 0) else ((1, 0), (-1, 0))
+                    d0 = math.dist(ctr, v)
+                    dists = sorted({round(max(0.3, d0 + dd), 3) for dd in (0, -0.25, 0.25, -0.5, 0.5, 0.75, 1.0)})
+                    dists.sort(key=lambda d: abs(d - d0))
+                    done = False
+                    for h in axis + diag + cross:
+                        hl = math.hypot(*h)
+                        for d in dists:
+                            nv = (ctr[0] + h[0] / hl * d, ctr[1] + h[1] / hl * d)
+                            if math.dist(nv, v) < 1e-4:
+                                continue
+                            new = [self.viaItem(c.net, nv, rule, rid),
+                                   self.trackItem(c.net, layer, ctr, nv, chain[0].width, rule.clearance, rid)]
+                            ok = True
+                            for t, fe in zip(tails, farEnds):
+                                legs = None
+                                for corner in self.legs(nv, fe):
+                                    path = [nv, fe] if corner is None else [nv, corner, fe]
+                                    if all(a == b or not self.check(self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid),
+                                                                     ignore={via.iid, t.iid}) for a, b in zip(path, path[1:])):
+                                        legs = path
+                                        break
+                                if legs is None:
+                                    ok = False
+                                    break
+                                new += [self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid)
+                                        for a, b in zip(legs, legs[1:]) if a != b]
+                            if not ok or len(new) - 1 > oldPieces:
+                                continue
+                            ignore = {via.iid} | {t.iid for t in chain} | {t.iid for t in tails}
+                            if any(self.check(it, ignore=ignore) for it in new) or self.viaSpacing(new + [
+                                    self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via" and i != via.iid]):
+                                continue
+                            self.swapItems(r, [via] + chain + tails, new)
+                            moved += 1
+                            done = True
+                            break
+                        if done:
+                            break
+                    if done:
+                        break
+        return moved
+
+    # ---- differential pairs laid together ------------------------------------------------
+    def padItems(self, pad):
+        nid = self.netId[pad.net]
+        return [self.sp.items[i] for i in self.netItems.get(nid, ())
+                if self.sp.items[i].kind == "pad" and self.sp.items[i].pad is pad]
+
+    @staticmethod
+    def unit(p, q):
+        L = math.dist(p, q)
+        return ((q[0] - p[0]) / L, (q[1] - p[1]) / L) if L > 1e-9 else (1.0, 0.0)
+
+    @staticmethod
+    def offsetPolyline(pts, d):
+        """The polyline shifted sideways by d (to the left of its direction for d > 0),
+        corners mitred."""
+        segs = []
+        for p, q in zip(pts, pts[1:]):
+            if math.dist(p, q) > 1e-9:
+                u = Router.unit(p, q)
+                segs.append((p, q, u, (-u[1], u[0])))
+        if not segs:
+            return [(pts[0][0], pts[0][1])]
+        out = [(segs[0][0][0] + segs[0][3][0] * d, segs[0][0][1] + segs[0][3][1] * d)]
+        for (p1, q1, u1, n1), (p2, q2, u2, n2) in zip(segs, segs[1:]):
+            a = (q1[0] + n1[0] * d, q1[1] + n1[1] * d)
+            b = (p2[0] + n2[0] * d, p2[1] + n2[1] * d)
+            det = u1[0] * (-u2[1]) - u1[1] * (-u2[0])
+            if abs(det) < 1e-9:
+                out.append(a)
+            else:
+                rx, ry = b[0] - a[0], b[1] - a[1]
+                t = (rx * (-u2[1]) - ry * (-u2[0])) / det
+                out.append((a[0] + u1[0] * t, a[1] + u1[1] * t))
+        p, q, u, n = segs[-1]
+        out.append((q[0] + n[0] * d, q[1] + n[1] * d))
+        return out
+
+    def searchPair(self, lead, follow, layers, winPad, extraMargin, viaMm, reach=0.0):
+        """One search for both nets of a pair: a centreline wide enough for two tracks at
+        the pair gap, from between the two start pads to between the two end pads."""
+        sp, k = self.sp, self.k
+        rule = self.ruleForConn(lead)
+        gap = self.m.classes[rule.cls].pairGap
+        half = (rule.width + gap) / 2
+        hv = (rule.viaDia + max(rule.clearance, gap)) / 2
+        W = 2 * rule.width + gap
+        crule = NetRule(W, W, rule.clearance, 2 * hv + rule.viaDia, rule.viaDrill, rule.cls)
+        srcItems = self.padItems(lead.a) + self.padItems(follow.a)
+        dstItems = self.padItems(lead.b) + self.padItems(follow.b)
+        if len(srcItems) < 2 or len(dstItems) < 2:
+            return None
+        pads = [lead.a, follow.a, lead.b, follow.b]
+        xs = [p.center[0] for p in pads]
+        ys = [p.center[1] for p in pads]
+        win = sp.winFor((min(xs), min(ys), max(xs), max(ys)), winPad)
+        # the centreline keeps clear of everything, the four pads included: each track
+        # leaves its pad on its own legs, so the pair never runs along a partner's pad
+        cost, viaok, wideOk, _ = self.buildCost(lead, crule, win, layers, [], [], False, extraMargin,
+                                                      ownNets=(-1,), ownPads=srcItems + dstItems)
+        i0, j0, i1, j1 = win
+        cy, cx = sp.cellCenters(win)
+
+        def ends(a, b, items):
+            # close to the two pads, but far enough from both that each track's start is
+            # clear of the other net's pad: pins too tight for two tracks between them
+            # (an ESD array, a connector) get short legs out to where the pair starts
+            m = np.zeros((len(layers), i1 - i0, j1 - j0), bool)
+            mid = ((a.center[0] + b.center[0]) / 2, (a.center[1] + b.center[1]) / 2)
+            r = max(half + k.grid, reach)
+            disk = (cx - mid[0]) ** 2 + (cy - mid[1]) ** 2 <= r ** 2
+            pads = np.zeros((i1 - i0, j1 - j0), bool)
+            for it in items:
+                self.paint(pads, win, it)
+            if pads.any():
+                disk &= edt(pads) * k.grid >= half + rule.width / 2 + rule.clearance
+            # and room for both tracks' starts beside the centreline, exactly
+            need = half + rule.width / 2 + rule.clearance + 2 * k.grid
+            for li, l in enumerate(layers):
+                if all(l in it.layers for it in items):
+                    m[li] = disk & (sp.foreignDist(0, l, win, nets=(-1,)) >= need)
+            return m & (cost >= 0)
+        src = ends(lead.a, follow.a, srcItems)
+        dst = ends(lead.b, follow.b, dstItems)
+        trace = os.environ.get("HR_TRACE_PAIR")
+        if not src.any() or not dst.any():
+            if trace:
+                self.log(f"pair {lead.net}/{follow.net}: reach {reach} winPad {winPad}: "
+                         f"{int(src.sum())} start cells, {int(dst.sum())} end cells")
+            return None
+        cells, _ = self.runKernel(lead, cost, viaok, wideOk, np.flatnonzero(src).astype(np.int32),
+                                  dst.astype(np.uint8), None, win, layers, viaMm, False)
+        if cells is None:
+            if trace:
+                self.log(f"pair {lead.net}/{follow.net}: reach {reach} winPad {winPad}: no path "
+                         f"({int(src.sum())} start cells, {int(dst.sum())} end cells)")
+            return None
+        return dict(cells=cells, terminalVia=False, srcItems=srcItems, dstItems=dstItems, rule=crule,
+                    win=win, half=half, hv=hv, trackRule=rule)
+
+    def layPair(self, lead, follow, res):
+        """Two sets of items from a pair's centreline: each net on its own side, vias
+        splayed apart at every layer change, each pad joined to its track's start with
+        straight legs. Returns (itemsA, itemsB) or None (the pair would have to cross)."""
+        rule, crule = res["trackRule"], res["rule"]
+        half, hv = res["half"], res["hv"]
+        w = rule.width
+        runs, _ = self.pathToGeometry(lead, res)
+        # the centreline is pulled tight as nobody's copper of double width: it must keep
+        # clear of the pads of both nets, as the search did
+        self.asForeign = True
+        try:
+            tight = [(layer, self.pullTight(lead, layer, pts, [True] * len(pts), crule)[0])
+                     for layer, pts, wide in runs]
+        finally:
+            self.asForeign = False
+
+        def runDir(ri, atStart):
+            """Direction of the centreline at a run's start or end; a lone-point run takes
+            its neighbour's."""
+            pts = tight[ri][1]
+            if len(pts) >= 2:
+                return self.unit(pts[0], pts[1]) if atStart else self.unit(pts[-2], pts[-1])
+            if ri > 0:
+                return runDir(ri - 1, False)
+            return runDir(ri + 1, True) if ri + 1 < len(tight) else (1.0, 0.0)
+
+        def leftOf(padA, padB, u):
+            """+1 when padA lies to the left of padB looking along u, -1 to the right, 0
+            when they are in line (then the other end decides)."""
+            dx, dy = padA.center[0] - padB.center[0], padA.center[1] - padB.center[1]
+            v = -u[1] * dx + u[0] * dy
+            return 0 if abs(v) < 0.05 else (1 if v > 0 else -1)
+        p0, u0 = tight[0][1][0], runDir(0, True)
+        p1, u1 = tight[-1][1][-1], runDir(len(tight) - 1, False)
+        sA0, sA1 = leftOf(lead.a, follow.a, u0), leftOf(lead.b, follow.b, u1)
+        sA0, sA1 = sA0 or sA1 or 1, sA1 or sA0 or 1
+        sB0 = -sA0
+        trace = os.environ.get("HR_TRACE_PAIR")
+        if trace:
+            self.log(f"pair {lead.net}/{follow.net}: centreline {[(l, [(round(x, 3), round(y, 3)) for x, y in pts]) for l, pts in tight]} sides {sA0}/{sB0}")
+        if sA0 != sA1:   # the pads ask for opposite sides: the pair would have to cross
+            if trace:
+                self.log(f"pair {lead.net}/{follow.net}: would cross; start {p0} dir {u0}, end {p1} dir {u1}")
+            return None
+        # at a layer change the two vias sit either side of the centreline on the
+        # bisector of the incoming and outgoing directions, so each net stays on its side
+        # through a turn; the tracks splay out to them and back
+        viaPos = {}
+        for ri in range(len(tight) - 1):
+            V = tight[ri][1][-1]
+            uin, uout = runDir(ri, False), runDir(ri + 1, True)
+            nb = (-(uin[1] + uout[1]), uin[0] + uout[0])
+            L = math.hypot(*nb)
+            nb = (nb[0] / L, nb[1] / L) if L > 1e-6 else (-uin[1], uin[0])
+            for sign in (1, -1):
+                viaPos[(ri, sign)] = (V[0] + nb[0] * sign * hv, V[1] + nb[1] * sign * hv)
+        plan = []   # per net: (conn, [(layer, points)], via points)
+        for conn, sign in ((lead, sA0), (follow, sB0)):
+            d = sign * half
+            polys = []
+            for ri, (layer, pts) in enumerate(tight):
+                off = self.offsetPolyline(pts, d)
+                s = hv - half
+                if ri < len(tight) - 1:              # ends in a via
+                    V, u = pts[-1], runDir(ri, False)
+                    n = (-u[1], u[0])
+                    vp = viaPos[(ri, sign)]
+                    if len(pts) >= 2 and math.dist(pts[-2], pts[-1]) > s + 0.05:
+                        off[-1] = (V[0] - u[0] * s + n[0] * d, V[1] - u[1] * s + n[1] * d)
+                        off.append(vp)
+                    else:
+                        off[-1] = vp
+                if ri > 0:                            # starts at a via
+                    V, u = pts[0], runDir(ri, True)
+                    n = (-u[1], u[0])
+                    vp = viaPos[(ri - 1, sign)]
+                    if len(pts) >= 2 and math.dist(pts[0], pts[1]) > s + 0.05:
+                        off[0] = (V[0] + u[0] * s + n[0] * d, V[1] + u[1] * s + n[1] * d)
+                        off.insert(0, vp)
+                    else:
+                        off[0] = vp
+                polys.append((layer, off))
+            plan.append((conn, polys, [vp for (ri, sg), vp in viaPos.items() if sg == sign]))
+
+        def merged(pts):
+            """Without repeated points and without the middle point of collinear pieces."""
+            out = []
+            for p in pts:
+                if out and math.dist(out[-1], p) < 1e-6:
+                    continue
+                if len(out) >= 2 and self.heading(out[-2], out[-1]) == self.heading(out[-1], p):
+                    out[-1] = p
+                else:
+                    out.append(p)
+            return out
+
+        def pieces(conn, polys, vias):
+            items = [self.trackItem(conn.net, layer, p, q, w, rule.clearance, 0)
+                     for layer, pts in polys for p, q in zip(merged(pts), merged(pts)[1:])]
+            return items + [self.viaItem(conn.net, vp, rule, 0) for vp in vias]
+        # the legs from each pad to its track, with the pair's own copper in view so a leg
+        # that has to go round a neighbouring pin does not land on the partner's track;
+        # then each end is pulled tight (legs plus the track's first bend) so the join
+        # reads as one line
+        temp = []
+        try:
+            for conn, polys, vias in plan:
+                for it in pieces(conn, polys, vias):
+                    self.sp.add(it)
+                    temp.append(it)
+            for conn, polys, vias in plan:
+                for end, pad in ((0, conn.a), (-1, conn.b)):
+                    layer, pts = polys[end]
+                    p = pts[0] if end == 0 else pts[-1]
+                    legs = self.padLegs(conn, layer, pad, p, rule)
+                    if legs is None:
+                        legs = self.legRoute(conn, pad, p, layer, rule)
+                    if legs is None:
+                        if trace:
+                            probe = self.trackItem(conn.net, layer, pad.center, p, rule.width, rule.clearance, 0)
+                            self.log(f"pair {lead.net}/{follow.net}: no way from {pad.ref}.{pad.num} {pad.center} to {p}; "
+                                     f"a straight leg hits {[(o.kind, o.tag, self.netName.get(o.net, o.net), o.layers) for o in self.check(probe)][:6]}")
+                        return None
+                    # a tiny first piece of the track (the search's first step) may go too
+                    if end == 0:
+                        k = 2 if len(pts) > 2 and math.dist(pts[0], pts[1]) < 0.3 else 1
+                        head = legs + pts[:k]
+                        head, _ = self.pullTight(conn, layer, head, [False] * len(head), rule)
+                        polys[end] = (layer, head + pts[k:])
+                    else:
+                        k = 2 if len(pts) > 2 and math.dist(pts[-2], pts[-1]) < 0.3 else 1
+                        tail = pts[-k:] + legs[::-1]
+                        tail, _ = self.pullTight(conn, layer, tail, [False] * len(tail), rule)
+                        polys[end] = (layer, pts[:-k] + tail)
+        finally:
+            for it in temp:
+                self.sp.remove(it.iid)
+                it.stamped = []
+        return [pieces(conn, polys, vias) for conn, polys, vias in plan]
+
+    def legRoute(self, conn, pad, target, layer, rule):
+        """A short search from a pad to a point on one layer (a pair's track start that no
+        straight leg reaches): the points from the pad to just before the target, or None."""
+        sp = self.sp
+        srcItems = self.padItems(pad)
+        if layer not in pad.layers or not srcItems:
+            return None
+        c = pad.center
+        bounds = (min(c[0], target[0]), min(c[1], target[1]), max(c[0], target[0]), max(c[1], target[1]))
+        for winPad in (1.5, 3.0):
+            win = sp.winFor(bounds, winPad)
+            cost, viaok, wideOk, _ = self.buildCost(conn, rule, win, [layer], srcItems, [], False, 0.0)
+            src = self.endpointCells(srcItems, [layer], win, cost)
+            cy, cx = sp.cellCenters(win)
+            near = (cx - target[0]) ** 2 + (cy - target[1]) ** 2
+            dst = (near <= (1.5 * sp.g) ** 2)[None] & (cost >= 0)
+            if not src.any() or not dst.any():
+                continue
+            cells, _ = self.runKernel(conn, cost, viaok, wideOk, np.flatnonzero(src).astype(np.int32),
+                                      dst.astype(np.uint8), None, win, [layer], None, False)
+            trace = os.environ.get("HR_TRACE_PAIR")
+            if cells is None:
+                if trace:
+                    self.log(f"leg {conn.net} {pad.ref}.{pad.num} -> {target}: no path in window {winPad}")
+                continue
+            res = dict(cells=cells, terminalVia=False, srcItems=srcItems, dstItems=[], rule=rule)
+            (lyr, pts, wide), = self.pathToGeometry(conn, res)[0]
+            entry, owner = self.entryLegs(conn, layer, pts[0], srcItems, rule)
+            pts = entry[::-1] + pts
+            wide = [False] * len(entry) + wide
+            for corner in self.legs(pts[-1], target):
+                tail = [pts[-1], target] if corner is None else [pts[-1], corner, target]
+                if self.pathOk(conn, layer, tail, rule.width, rule):
+                    pts = pts + tail[1:]
+                    wide = wide + [False] * (len(tail) - 1)
+                    break
+            else:
+                if trace:
+                    self.log(f"leg {conn.net} {pad.ref}.{pad.num} -> {target}: path ends at {pts[-1]}, no clear tail")
+                continue
+            pts, widths = self.pullTight(conn, layer, pts, wide, rule)
+            return pts[:-1]
+        return None
+
+    def padLegs(self, conn, layer, pad, p, rule):
+        """Points from the pad's centre to p (not including p): straight or one bend, the
+        first leg along the pad's long axis when it can be."""
+        c = pad.center
+        if math.dist(c, p) < 1e-6:
+            return [c]
+        minx, miny, maxx, maxy = pad.poly.bounds
+        axis = (1, 0) if maxx - minx >= maxy - miny else (0, 1)
+        best = None
+        for corner in self.legs(c, p):
+            path = [c, p] if corner is None else [c, corner, p]
+            if not self.pathOk(conn, layer, path, rule.width, rule):
+                continue
+            h = self.heading(path[0], path[1])
+            along = (abs(h[0]), abs(h[1])) == axis
+            if along or best is None:
+                best = path[:-1]
+            if along:
+                break
+        return best
+
+    def pairClear(self, itemsA, itemsB):
+        """The two nets' new items against each other (the board check cannot see them)."""
+        for a in itemsA:
+            for b in itemsB:
+                if not set(a.layers) & set(b.layers):
+                    continue
+                if a.geom.distance(b.geom) < max(a.clearance, b.clearance) - 1e-6:
+                    return False
+                if a.kind == "via" and b.kind == "via" and \
+                        math.dist(a.pts[0], b.pts[0]) - a.drill / 2 - b.drill / 2 < self.m.minHoleToHole:
+                    return False
+        return True
+
+    def commitPair(self, conn, items):
+        rid = self.nextRid
+        self.nextRid += 1
+        for it in items:
+            it.route = rid
+            self.sp.add(it)
+            self.netItems.setdefault(it.net, set()).add(it.iid)
+        r = Route(rid, conn, [it.iid for it in items], [("pad", conn.a.pid), ("pad", conn.b.pid)],
+                  set(), paired=True)
+        self.routes[rid] = r
+        conn.routed = True
+        conn.rid = rid
+        return r
+
+    def routePair(self, lead, follow, layers, winPads, viaMm=None):
+        """Lay both nets of a pair together; True when both are now routed. Tried once per
+        pair (repairPair asks again at the end)."""
+        if lead.routed or follow.routed or self.connected(lead) or self.connected(follow) \
+                or lead.pairTried:
+            return False
+        lead.pairTried = True
+        trace = os.environ.get("HR_TRACE_PAIR")
+        for reach in (0.0, self.k.pairStartMm, 2 * self.k.pairStartMm):   # between the pads first, then near them
+            for wp in winPads:
+                for extra in (0.0, 0.03):
+                    res = self.searchPair(lead, follow, layers, wp, extra, viaMm, reach)
+                    if res is None:
+                        break           # no path in this window: a wider margin will not help
+                    laid = self.layPair(lead, follow, res)
+                    if laid is None:
+                        break           # the pair would cross, or a pad has no way out: try
+                                        # another window, whose path may start elsewhere
+                    itemsA, itemsB = laid
+                    bad = [it for it in itemsA + itemsB if self.check(it)]
+                    if bad or self.viaSpacing(itemsA) or self.viaSpacing(itemsB) \
+                            or not self.pairClear(itemsA, itemsB):
+                        if trace:
+                            self.log(f"pair {lead.net}/{follow.net}: {len(bad)} pieces fail the exact check, "
+                                     f"cross clear {self.pairClear(itemsA, itemsB)}: "
+                                     + "; ".join(f"{it.kind} {it.layers[0]} {it.pts} w{it.width} hits "
+                                                 f"{[(o.kind, o.tag, self.netName.get(o.net, o.net), o.layers, o.pts) for o in self.check(it)]}"
+                                                 for it in bad[:3]))
+                        continue        # a raster error against something: once more with margin
+                    self.commitPair(lead, itemsA)
+                    self.commitPair(follow, itemsB)
+                    if trace:
+                        self.log(f"pair {lead.net}/{follow.net}: laid together ({len(itemsA)} + {len(itemsB)} pieces)")
+                    return True
+                if res is not None and laid is not None:
+                    break               # laid but failed twice: a different window will not help
         return False
 
     # ---- differential pairs -------------------------------------------------------------
@@ -960,6 +1625,7 @@ class Router:
         for r in old:
             r.oldItems = [self.sp.items[i] for i in r.items]
             self.rip(r.rid)
+        lead.pairTried = follow.pairTried = False
         new = []
         for c in (lead, follow):
             st, rt = self.route(c, layers, winPads, viaMm=viaMm)
@@ -982,35 +1648,37 @@ class Router:
 
     @staticmethod
     def serpentine(p, q, w, side, extra, amax, pitch):
-        """The run p->q with rectangular bumps (45 deg corners) to one side that add up to
-        `extra` mm of length, at most `amax` high. Returns (points, mm added), or None when
-        the run is too short or the extra too small for one bump."""
+        """The run p->q with trapezoid bumps (45 deg flanks, flat top) to one side that add
+        up to `extra` mm of length, at most `amax` high: few and tall, as a person draws
+        them. Returns (points, mm added), or None when the run is too short."""
         L = math.dist(p, q)
         if L < 1e-6:
             return None
         u = ((q[0] - p[0]) / L, (q[1] - p[1]) / L)
         n = (-u[1] * side, u[0] * side)
-        c0 = w                                  # corner chamfer
-        lost = (8 - 4 * math.sqrt(2)) * c0      # what the chamfers take off 2 * amplitude
-        adv = 4 * c0 + pitch                    # run length one bump spans
+        top = max(2 * w, pitch)                 # a bump's flat top
+        gap = max(0.5 * amax, pitch)            # between bumps
         margin = max(2 * w, 0.3)
-        fit = int((L - 2 * margin + pitch) // (adv + pitch))
-        if fit < 1 or extra < 4 * c0 - lost or amax < 2 * c0:
+        perA = 2 * (math.sqrt(2) - 1)           # mm gained per mm of amplitude
+        amin = max(2 * w, 0.3)
+        if extra < perA * amin or amax < amin:
             return None
-        nb = min(fit, math.ceil(extra / (2 * amax - lost)))
-        A = max(2 * c0, min(amax, (extra / nb + lost) / 2))
-        gain = nb * (2 * A - lost)
-        span = nb * adv + (nb - 1) * pitch
+        nb = math.ceil(extra / (perA * amax))
+        A = min(amax, extra / (nb * perA))
+        while nb >= 1 and nb * (2 * A + top) + (nb - 1) * gap > L - 2 * margin:
+            nb -= 1
+            A = min(amax, extra / (nb * perA)) if nb else 0.0
+        if nb < 1:
+            return None
+        span = nb * (2 * A + top) + (nb - 1) * gap
         x = (L - span) / 2
         at = lambda a, b: (p[0] + u[0] * a + n[0] * b, p[1] + u[1] * a + n[1] * b)
         pts = [p]
         for _ in range(nb):
-            pts += [at(x, 0), at(x + c0, c0), at(x + c0, A - c0), at(x + 2 * c0, A),
-                    at(x + 2 * c0 + pitch, A), at(x + 3 * c0 + pitch, A - c0),
-                    at(x + 3 * c0 + pitch, c0), at(x + adv, 0)]
-            x += adv + pitch
+            pts += [at(x, 0), at(x + A, A), at(x + A + top, A), at(x + 2 * A + top, 0)]
+            x += 2 * A + top + gap
         pts.append(q)
-        return pts, gain
+        return pts, nb * perA * A
 
     def lengthen(self, conn, extra, amax):
         """Add about `extra` mm to a routed connection with serpentines on its longest
@@ -1061,25 +1729,32 @@ class Router:
 
     def matchPairs(self, partners, budgetFor, log):
         """Differential pairs whose two nets differ in length by more than their skew
-        budget: the shorter net is lengthened with serpentines to match."""
+        budget: the shorter net is lengthened with serpentines to match. A pair that is
+        off by far more than its budget took two different paths; that is left for the
+        reviewer rather than hidden under a wall of bumps (budgetFor returns
+        (mm, fromRule))."""
         for a, b in sorted(partners.items()):
             if a > b or a not in self.netId or b not in self.netId:
                 continue
-            budget = budgetFor(a)
+            budget, fromRule = budgetFor(a)
             la, lb = self.netLength(a), self.netLength(b)
             skew = abs(la - lb)
-            if skew <= budget * 0.5:
+            if skew <= budget:
+                continue
+            if not fromRule and skew > max(4 * budget, 5.0):
+                log(f"length match {a}/{b}: skew {skew:.2f} mm left alone (no skew rule; the two "
+                    f"nets took different paths)")
                 continue
             short = a if la < lb else b
             conns = sorted({id(rt.conn): rt.conn for rt in self.routes.values()
                             if rt.conn.net == short and rt.conn.b is not None}.values(),
                            key=lambda c: -self.routeCost(c.rid)[0])
-            added = 0.0
+            added, want = 0.0, skew - budget * 0.5
             for c in conns:
-                if skew - added <= budget * 0.25:
+                if want - added <= 0.05:
                     break
                 w = self.ruleForConn(c).width
-                added += self.lengthen(c, skew - added, max(1.0, 5 * w))
+                added += self.lengthen(c, want - added, max(1.5, 6 * w))
             after = abs(self.netLength(a) - self.netLength(b))
             log(f"length match {a}/{b}: skew {skew:.2f} -> {after:.2f} mm (budget {budget:.2f})")
 
@@ -1238,6 +1913,10 @@ class Router:
         if self.connected(conn):
             conn.routed = True
             return "ok", None
+        mate = conn.pairMate
+        if mate is not None and not negotiate and not mate.routed and not self.connected(mate) \
+                and self.routePair(conn, mate, layers, winPads, viaMm):
+            return "ok", self.routes[conn.rid]
         self.forbidVias = []
         for extra in (0.0, 0.03, 0.03):
             for wp in winPads:

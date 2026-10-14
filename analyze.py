@@ -16,6 +16,10 @@ Per board:
               edge gap 0.35 mm or less)
   pour gaps   areas on the outer layers with no copper at all, larger than 1 mm^2
               after ignoring clearance slivers: places a ground pour could not reach
+  tidiness    how the tracks read: bends per 10 mm of track, jogs (a run that shifts
+              sideways and carries on, within 1 mm), steps (any track piece under
+              0.5 mm between two bends), and the share of track ends on SMD pads that
+              land on the pad's centre
 """
 import math
 import sys
@@ -190,10 +194,72 @@ def pourGaps(board, cell=0.1, minArea=1.0, sliver=0.35):
     return out
 
 
+def tidiness(board):
+    segs = []
+    for t in board.GetTracks():
+        if t.GetClass() != "PCB_TRACK" or t.GetLength() < 1e3:
+            continue
+        s, e = t.GetStart(), t.GetEnd()
+        segs.append((t.GetNetname(), t.GetLayer(), (s.x / NM, s.y / NM), (e.x / NM, e.y / NM)))
+    total = sum(math.dist(p, q) for _, _, p, q in segs)
+    ends = {}
+    for i, (net, layer, p, q) in enumerate(segs):
+        for pt in (p, q):
+            ends.setdefault((net, layer, round(pt[0], 4), round(pt[1], 4)), []).append(i)
+
+    def heading(p, q):
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        return (0 if abs(dx) < 1e-6 else (1 if dx > 0 else -1), 0 if abs(dy) < 1e-6 else (1 if dy > 0 else -1))
+
+    def other(i, pt):
+        _, _, p, q = segs[i]
+        return q if math.dist(p, pt) < 1e-4 else p
+
+    def bendAt(key):
+        """True when exactly two pieces meet here at an angle."""
+        ids = ends[key]
+        if len(ids) != 2:
+            return False
+        pt = (key[2], key[3])
+        a, b = (other(i, pt) for i in ids)
+        return heading(pt, a) != tuple(-x for x in heading(pt, b))
+    bends = sum(1 for key in ends if bendAt(key))
+    jogs = steps = 0
+    for i, (net, layer, p, q) in enumerate(segs):
+        kp, kq = (net, layer, round(p[0], 4), round(p[1], 4)), (net, layer, round(q[0], 4), round(q[1], 4))
+        if not (bendAt(kp) and bendAt(kq)):
+            continue
+        L = math.dist(p, q)
+        if L < 0.5:
+            steps += 1
+        if L < 1.0:
+            before = other(next(j for j in ends[kp] if j != i), p)
+            after = other(next(j for j in ends[kq] if j != i), q)
+            if heading(before, p) == heading(q, after):
+                jogs += 1
+    centred = onPad = 0
+    for fp in board.GetFootprints():
+        for pad in fp.Pads():
+            if pad.GetAttribute() != pcbnew.PAD_ATTRIB_SMD:
+                continue
+            poly = polySetToShapely(pad.GetEffectivePolygon(pad.GetLayer()))
+            c = pad.GetCenter()
+            c = (c.x / NM, c.y / NM)
+            for key, ids in ends.items():
+                if key[0] != pad.GetNetname() or len(ids) != 1 or key[1] != pad.GetLayer():
+                    continue
+                pt = (key[2], key[3])
+                if poly.contains(Point(pt)):
+                    onPad += 1
+                    centred += math.dist(pt, c) < 0.05
+    return dict(bendsPer10mm=round(10 * bends / max(total, 1e-9), 2), jogs=jogs, steps=steps,
+                padEndsCentred=f"{centred}/{onPad}")
+
+
 def analyze(path, plane="GND"):
     b = pcbnew.LoadBoard(path)
     return dict(direction=direction(b), vias=vias(b, plane), reference=reference(b, plane),
-                pairs=pairs(b), pourGaps=pourGaps(b))
+                pairs=pairs(b), pourGaps=pourGaps(b), tidiness=tidiness(b))
 
 
 if __name__ == "__main__":

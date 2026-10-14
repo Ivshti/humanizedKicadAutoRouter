@@ -196,8 +196,10 @@ class Space:
         return out
 
     # ---- distance fields ---------------------------------------------------------
-    def foreignDist(self, net, layer, win, reach=0.9, fixedOnly=False):
-        """Distance (mm) from each cell centre in win to the nearest copper of another net."""
+    def foreignDist(self, net, layer, win, reach=0.9, fixedOnly=False, nets=None):
+        """Distance (mm) from each cell centre in win to the nearest copper of another net
+        (`nets`: several nets count as own, e.g. both of a differential pair)."""
+        own = tuple(nets) if nets else (net,)
         i0, j0, i1, j1 = win
         r = int(math.ceil(reach / self.g))
         I0, J0 = max(i0 - r, 0), max(j0 - r, 0)
@@ -205,8 +207,8 @@ class Space:
         src = self.fixed if fixedOnly else self.occ
         sub = src[layer, I0:I1, J0:J1] if layer is not None else src[:, I0:I1, J0:J1]
         if layer is None:  # any layer (through vias)
-            sub = np.where(((sub != 0) & (sub != net)).any(axis=0), HARD, 0)
-        free = (sub == 0) | (sub == net)
+            sub = np.where(((sub != 0) & ~np.isin(sub, own)).any(axis=0), HARD, 0)
+        free = (sub == 0) | np.isin(sub, own)
         if free.all():
             return np.full((i1 - i0, j1 - j0), 1e3, np.float32)
         d = edt(~free) * self.g

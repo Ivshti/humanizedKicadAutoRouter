@@ -69,7 +69,7 @@ Options:
 | `--out DIR` | where the routed copy goes (required) |
 | `--flows FILE` | how much current each power net carries; see below |
 | `--minutes N` | time budget, default 25; it stops negotiating when this runs out |
-| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=3`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py`. Useful ones: `viaMm` (what a via costs, in mm of track; 5), `topDiagonal` (`/`, `\` or `auto`), `pairSkewMm` |
+| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=3`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py`. Useful ones: `viaMm` (what a via costs, in mm of track; 5), `topDiagonal` (`/`, `\` or `auto`), `pairSkewMm`, `signalWidth` (0 = your Default net class width) |
 
 Progress is printed as it goes. The last line is the DRC result, for example
 `DRC: 0 violations {}, 0 unconnected`.
@@ -168,7 +168,7 @@ check the following.
     gap from the `.kicad_pro`. Their lengths are matched to the skew budget
     of a `(constraint skew (max …))` rule in the `.kicad_dru` whose condition
     names the pair with `A.inDiffPair('…')`; a pair without such a rule is
-    matched to 0.5 mm (`--knob pairSkewMm=…`).
+    matched to 1.5 mm (`--knob pairSkewMm=…`).
 
 Any existing tracks, vias and outer-layer copper pours are removed before
 routing. The router always starts from a clean board, plus your inner planes.
@@ -243,18 +243,29 @@ It follows the order a person uses:
    order across the bundle, so they lie side by side instead of crossing. A
    member's vias belong next to its own pins or where its corridor planned a
    layer change; a via anywhere else is priced like three, so mid-route hops
-   are a last resort. The second net of a differential pair follows the first
-   at the pair gap and changes layer right beside it.
+   are a last resort. A differential pair is drawn as one: a single search
+   wide enough for both tracks at the pair gap, then split into the two
+   tracks, which run side by side, turn together and splay apart just enough
+   at every layer change for their two vias. Where the two pads are on the
+   wrong sides for that (the pair would have to cross), the second net
+   follows the first at the pair gap instead.
 7. **Push and shove.** A connection that cannot get through may route across
    others at a price. The ones it crossed are ripped and routed again, and the
    board remembers where the fights were.
 8. **Tidy up.** The worst detours are re-routed against the finished board.
    Then every route with vias is retried with vias priced much higher. A new
-   route is kept only if it is better.
-9. **Length matching.** The shorter net of each differential pair gets
-   serpentines on its longest straight runs until the pair is within its skew
-   budget. Each bump is checked against the finished board before it is
-   placed, so a pair in a tight spot may end up matched less closely.
+   route is kept only if it is better. Then every route is retried once more
+   with corners priced high and kept when it has fewer of them and is no
+   longer. Finally a via that sits a short stub away from a pad is moved so
+   the stub leaves the pad's centre in a straight line, along the pad's long
+   axis when it can. Anything a tidying pass left apart is routed again.
+9. **Length matching.** The shorter net of each differential pair gets a few
+   tall trapezoid bumps on its longest straight runs until the pair is within
+   its skew budget. Each bump is checked against the finished board before it
+   is placed, so a pair in a tight spot may end up matched less closely. A
+   pair with no skew rule of its own that is off by several times the default
+   budget took two different paths; it is reported and left alone rather than
+   buried under bumps.
 10. **Power copper.** Every power track is widened to the widest that fits, so
     neighbouring tracks of one net overlap into a small pour, the way a person
     lays overlapping thick tracks. A track that ends on a pad grows no wider
@@ -276,7 +287,11 @@ Throughout, signal tracks are drawn to run one clearance away from existing
 wiring. Tracks pack together the way a person nudges them, and the space left
 over stays in one piece for the ground pour.
 
-All tracks are horizontal, vertical or 45°.
+All tracks are horizontal, vertical or 45°. Each piece of a route is pulled
+straight after the search: a stair-step the grid produced becomes one straight
+run plus one 45° leg, with the bend placed where the route already turns, and
+every track ends on the centre of its pad, entering along the pad's long axis.
+Signal tracks use the width of your Default net class.
 
 ---
 
@@ -313,9 +328,20 @@ signal/power) and how many segments are not 0/45/90°.
   inner ground plane, for example over a slot between via clearances.
 - **pour gaps:** areas on the outer layers with no copper at all, larger than
   1 mm², i.e. places the ground pour could not reach.
+- **tidiness:** how the tracks read: bends per 10 mm of track, jogs (a run
+  that shifts sideways and carries on within 1 mm), steps (any piece under
+  0.5 mm between two bends) and the share of track ends on SMD pads that
+  land on the pad's centre.
 
 All three are handy for comparing against a hand-routed version of the same
 board.
+
+When a result has an unconnected item or a dangling track, run with
+`HR_AUDIT=1` in the environment: after each phase the router checks its own
+model for track ends that touch nothing, or only wiring it does not know it
+depends on, and prints what it finds. `HR_PROBE="x,y;x,y"` (mm) lists what the
+model holds at those points, and `HR_PROBE_NET=NAME` lists every route of a
+net, after each phase.
 
 ---
 

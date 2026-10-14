@@ -154,6 +154,8 @@ def linkPairs(conns, partners):
             continue
         for c in byNet[net]:
             ends = {c.a.ref, c.b.ref}
+            if len(ends) < 2:   # a part's own pass-through pins: nothing to pair
+                continue
             mates = [d for d in byNet[other] if d.pairLeader is None and {d.a.ref, d.b.ref} == ends]
             if mates:
                 mates[0].pairLeader = c
@@ -219,10 +221,15 @@ def plan(model, router, log=print, flows=()):
 
 
 def phaseOrder(conns):
-    """Strategy order: RF, block internals (shortest first) with their GND, power, bundles."""
+    """Strategy order: RF, a block's own differential pairs, block internals (shortest
+    first) with their GND, power, bundles. A block's pairs go early so both tracks can be
+    laid side by side before other wiring takes the room next to their pins; a pair
+    between blocks runs with its bundle in its corridor."""
     def key(c):
         if c.kind == "rf":
             return (0, 0, c.order)
+        if c.pairMate is not None and not c.bundle:
+            return (0, 1, c.order)
         if c.kind in ("sig", "pwr") and c.block:
             return (1, -c.amps, c.order)
         if c.kind == "gnd":
