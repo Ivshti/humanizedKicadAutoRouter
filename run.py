@@ -689,6 +689,7 @@ def main():
             negotiate(router, list(stranded), log, maxRounds=10, winPads=(2.0, 6.0, 15.0))
             log(f"stranded GND pads: {sum(1 for c in stranded if router.connected(c))}/{len(stranded)} "
                 f"fanned out to the plane")
+            audit(router, log, "stranded GND repair")
         fixed = sum(1 for c in stranded + repaired if router.connected(c))
         if not fixed:
             break

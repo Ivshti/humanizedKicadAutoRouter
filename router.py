@@ -1008,6 +1008,34 @@ class Router:
         out.sort(key=lambda e: e[0])
         return out
 
+    def viaOntoTrack(self, conn, res, runs, vias, rule):
+        """A route that ends (or starts) with a via landing on another track of its net,
+        off that track's centreline: the via and the piece before it slide onto the
+        centreline (KiCad warns about a track that is not centred on a via)."""
+        runs = list(runs)
+        vias = list(vias)
+        for end in (-1, 0):
+            if len(runs) < 2 or len(runs[end][1]) != 1 or (end == -1 and res["terminalVia"]):
+                continue
+            lyr, pts1, w1 = runs[end]
+            items = res["dstItems"] if end == -1 else res["srcItems"]
+            p = pts1[0]
+            owner = next((it for it in items if lyr in it.layers and it.kind == "track"
+                          and it.geom.buffer(1e-3).contains(Point(p))), None)
+            if owner is None:
+                continue
+            k = -2 if end == -1 else 1
+            lyr0, pts0, w0 = runs[k]
+            seq = pts0 if end == -1 else pts0[::-1]
+            moved = self.slideOnto(conn, lyr0, seq, owner, rule)
+            q = moved[-1]
+            if q == seq[-1] or self.check(self.viaItem(conn.net, q, rule, 0)):
+                continue
+            runs[k] = (lyr0, moved if end == -1 else moved[::-1], w0)
+            runs[end] = (lyr, [q], w1)
+            vias[end] = q
+        return runs, vias
+
     def slideOnto(self, conn, layer, pts, track, rule):
         """A run that ends inside another track's copper but off its centreline (no leg
         long enough fitted) is slid along its own last piece onto that centreline: KiCad
@@ -1088,6 +1116,7 @@ class Router:
     def buildItems(self, conn, res, rid):
         rule = res["rule"]
         runs, vias = self.pathToGeometry(conn, res)
+        runs, vias = self.viaOntoTrack(conn, res, runs, vias, rule)
         items = []
         for ri, (layer, pts, wide) in enumerate(runs):
             onTrack = [False, False]
