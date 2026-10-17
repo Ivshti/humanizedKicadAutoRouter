@@ -191,6 +191,63 @@ def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=
     return nT, nV + nSt, nSt, stranded
 
 
+def pourTargets(board, router, net="GND"):
+    """{layer: board raster} of the outer pour pieces of `net` that hold a via or a
+    through-hole pad of it (stitched to the plane), from the board's current fill."""
+    sp = router.sp
+    nid = router.netId[net]
+    rv = router.rules[net].viaDia / 2
+    anchors = [Point(it.pts[0]) for it in sp.items.values() if it.net == nid and it.kind == "via"]
+    anchors += [Point(p.center) for p in router.m.nets.get(net, []) if not p.smd]
+    out = {}
+    for layer, lid in ((F, pcbnew.F_Cu), (B, pcbnew.B_Cu)):
+        m = np.zeros((sp.H, sp.W), bool)
+        for z in board.Zones():
+            if z.GetNetname() != net or not z.IsOnLayer(lid) or z.GetIsRuleArea():
+                continue
+            fill = polySetToShapely(z.GetFilledPolysList(lid))
+            for piece in getattr(fill, "geoms", [fill]) if fill is not None else []:
+                near = piece.buffer(rv + 0.05)
+                if not any(near.contains(a) for a in anchors):
+                    continue
+                inner = piece.buffer(-0.05)
+                win, mask = sp.rasterMask(inner) if not inner.is_empty else (None, np.zeros(0))
+                if mask.size:
+                    i0, j0, i1, j1 = win
+                    m[i0:i1, j0:j1] |= mask
+        out[layer] = m
+    return out
+
+
+def repairUnreached(board, router, conns, log):
+    """Pads the pour does not reach, under fanoutParts=none (no via beside a GND pad):
+    a passive's or connector's pad gets a short track to the nearest stitched pour on its
+    layer; a chip's exposed pad gets a via inside it; a chip's pin gets a fanout that
+    prefers the inside of the pin ring. A via beside the pad, at least stitchPadGapMm
+    from every pad, is the last resort. Returns the connections left for push and shove
+    (fanouts)."""
+    targets = pourTargets(board, router)
+    done = Counter()
+    fanout = []
+    for c in conns:
+        if router.isExposedPad(c.a):
+            if router.viaInPad(c):
+                done["via in the exposed pad"] += 1
+                continue
+        elif not router.isRingChip(c.a):
+            if router.routeToPour(c, targets[c.a.side]):
+                done["track to the pour"] += 1
+                continue
+            c.viaGapMm = router.k.stitchPadGapMm   # last resort: a via beside it, kept clear
+            done["via beside the pad (last resort)"] += 1
+        else:
+            done["via inside the pin ring"] += 1
+        c.deferred = False
+        fanout.append(c)
+    log("pads the pour does not reach: " + (", ".join(f"{n} {how}" for how, n in done.items()) or "none"))
+    return fanout
+
+
 def strandedGnd(drc, conns):
     """GND fanout connections whose pad DRC reports as unconnected."""
     byPad = {(c.a.ref, c.a.num): c for c in conns if c.kind == "gnd"}
@@ -561,16 +618,23 @@ def main():
     for _ in range(2):
         # GND pads whose piece of pour ended up cut off: fan them out to the plane after
         # all, pushing other routes aside, and write the board again
-        stranded = strandedGnd(drc, conns) + [c for c in islandPads if not c.routed]
+        found = strandedGnd(drc, conns)
+        stranded = found + [c for c in islandPads if not c.routed and c not in found]
         if router.k.fanoutParts == "none":
-            # those pads take the pour by design: a pad it misses is reported, not given
-            # a via of its own
-            stranded = [c for c in stranded if not c.deferred]
-        if not stranded:
+            # those pads take the pour by design; one it misses is joined to the pour,
+            # not given a via beside it unless nothing else works
+            missed = [c for c in stranded if c.deferred]
+            stranded = [c for c in stranded if not c.deferred] + repairUnreached(board, router, missed, log)
+            repaired = [c for c in missed if router.connected(c)]
+        else:
+            repaired = []
+        if not stranded and not repaired:
             break
-        negotiate(router, list(stranded), log, maxRounds=10, winPads=(2.0, 6.0, 15.0))
-        fixed = sum(1 for c in stranded if router.connected(c))
-        log(f"stranded GND pads: {fixed}/{len(stranded)} fanned out to the plane")
+        if stranded:
+            negotiate(router, list(stranded), log, maxRounds=10, winPads=(2.0, 6.0, 15.0))
+            log(f"stranded GND pads: {sum(1 for c in stranded if router.connected(c))}/{len(stranded)} "
+                f"fanned out to the plane")
+        fixed = sum(1 for c in stranded + repaired if router.connected(c))
         if not fixed:
             break
         nT, nV, nIsl, islandPads = finish()

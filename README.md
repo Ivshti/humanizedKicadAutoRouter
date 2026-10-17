@@ -84,7 +84,7 @@ Knobs worth knowing:
 | `pairSkewMm` | 1.5 | length mismatch allowed in a differential pair with no skew rule of its own |
 | `signalWidth` | 0 | signal track width; 0 uses your Default net class |
 | `neckMm` | 0.5 | a power track narrows only this close to a pad of its own that is narrower than the track; anywhere else it keeps its width or the connection is reported unrouted |
-| `fanoutParts` | `caps-ics` | which ground pads get their own via: `all`; `caps-ics` (capacitors and multi-pin parts other than connectors; a resistor's, diode's or connector's ground pad takes the pour, and gets a via only when the pour misses it); or `none` (every ground pad takes the pour, stitching feeds the pour, and a pad the pour misses is reported, not given a via). Pads of other plane nets (a supply plane) always get their via, since nothing pours them on the outer layers |
+| `fanoutParts` | `caps-ics` | which ground pads get their own via: `all`; `caps-ics` (capacitors and multi-pin parts other than connectors; a resistor's, diode's or connector's ground pad takes the pour, and gets a via only when the pour misses it); or `none` (every ground pad takes the pour and stitching feeds the pour). With `none`, a pad the pour misses after routing is joined in this order: a passive's or connector's pad by a short track to the nearest stitched pour on its layer; a chip's exposed pad by a via inside it; a chip's pin by a via inside its pin ring; and only as a last resort by a via beside the pad, 0.5 mm clear of every pad. The log says which pads got what. Pads of other plane nets (a supply plane) always get their via, since nothing pours them on the outer layers |
 | `fanoutViaGapMm` | 0.25 | bare board kept between a ground fanout via and any pad edge, its own pad included |
 | `fanoutInsideMult` | 3 | how much more a fanout pays where its via does not belong: inside a small part's outline (so the via lands on the far side from its other pads), or in the band just outside a chip's ring of pins, where the wiring to its other pins arrives (so the via goes inside the ring, under the body) |
 | `thermalHard` | `true` | other nets may not cross the path of a ground pad's thermal spokes (except within 0.3 mm of their own pads); `false` makes it only a cost (`thermalPenalty`) |
@@ -305,7 +305,8 @@ It follows the order a person uses:
     is stitched to the plane: every piece of it gets two vias (a through-hole
     ground pad counts as one), so none hangs on pad thermals alone, and open
     pour gets a via every 4 mm. Stitching vias keep 0.5 mm of bare board to
-    every pad and stay out of keep-out areas. A ground pad whose thermal spokes
+    every pad and stay out of every rule area, including ones that only forbid
+    parts (a printed logo under a clear case is no place for a via). A ground pad whose thermal spokes
     end up blocked is given a solid connection.
 13. **Check and repair.** KiCad's DRC runs on the saved board. A ground pad
     that the pour could not reach is then given a fanout via after all, pushing

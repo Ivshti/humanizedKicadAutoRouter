@@ -151,6 +151,7 @@ class Conn:
     pairTried: bool = False   # the pair was already tried together (see Router.routePair)
     deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
     layerLock: int = -1       # the only layer this connection may use (-1: any)
+    viaGapMm: float = -1.0    # a fanout's via-to-pad gap when not fanoutViaGapMm (-1)
 
 
 @dataclass
@@ -195,6 +196,7 @@ class Router:
         for pad in model.pads:
             self.padsOfRef.setdefault(pad.ref, []).append(pad)
         self.hulls = {}
+        self.ruleAreas = np.zeros((self.sp.H, self.sp.W), bool)   # cells within any rule area
         # nets the finished board pours on both outer layers (finishBoard): their pads
         # can be left to the pour
         self.outerPourNets = {"GND"} & self.planeNets
@@ -307,6 +309,12 @@ class Router:
                 win, mask = sp.rasterMask(ko.poly, 0.45 + self.k.margin)
                 i0, j0, i1, j1 = win
                 sp.viaKeep[i0:i1, j0:j1] |= mask
+            # stitching stays out of every rule area, whatever it forbids (a "no parts"
+            # area over printed artwork is no place for a via either)
+            win, mask = sp.rasterMask(ko.poly, 0.45 + self.k.margin)
+            if mask.size:
+                i0, j0, i1, j1 = win
+                self.ruleAreas[i0:i1, j0:j1] |= mask
         self.loadStrategyRasters()
 
     def loadStrategyRasters(self):
@@ -705,7 +713,8 @@ class Router:
         if tvia is not None and conn.kind == "gnd":
             # a fanout via keeps fanoutViaGapMm of bare board to every pad, its own too,
             # and lands on the side away from the rest of its part
-            tvia &= self.padEdgeDist[i0:i1, j0:j1] >= rule.viaDia / 2 + k.fanoutViaGapMm + k.grid
+            gap = conn.viaGapMm if conn.viaGapMm >= 0 else k.fanoutViaGapMm
+            tvia &= self.padEdgeDist[i0:i1, j0:j1] >= rule.viaDia / 2 + gap + k.grid
             avoid = self.fanoutAvoid(conn.a, win)
             if avoid is not None:
                 sub = cost[:, avoid]
@@ -732,7 +741,7 @@ class Router:
         if pad.ref not in self.hulls:
             self.hulls[pad.ref] = unary_union([q.poly for q in pads]).convex_hull
         hull = self.hulls[pad.ref]
-        area = hull.buffer(self.k.escapeMm).difference(hull) if len(pads) > self.RING_PADS else hull
+        area = hull.buffer(self.k.escapeMm).difference(hull) if self.isRingChip(pad) else hull
         geom = area.difference(pad.poly.buffer(self.k.grid))
         i0, j0, i1, j1 = win
         out = np.zeros((i1 - i0, j1 - j0), bool)
@@ -1994,11 +2003,86 @@ class Router:
         rv = rule.viaDia / 2
         m = k.margin
         ok = sp.foreignDist(nid, None, win, reach=0) >= rv + max(rule.clearance, 0.25) + m
-        ok &= ~sp.viaKeep
+        ok &= ~sp.viaKeep & ~self.ruleAreas
         ok &= self.padEdgeDist >= rv + k.stitchPadGapMm + sp.g
         ok &= self.holeDist >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         ok &= sp.maskDist(sp.viaAt, win, reach=0, pred=lambda a: a != 0) >= rule.viaDrill + 0.6
         return ok
+
+    CONNECTOR_PREFIXES = {"J", "P", "CN", "CON", "X", "USB"}
+
+    def isRingChip(self, pad):
+        """A chip with a ring of pins: many pads, and not a connector (a connector's rows
+        have no inside to put a via in)."""
+        m = re.match(r"[A-Za-z]+", pad.ref)
+        prefix = m.group(0).upper() if m else ""
+        return len(self.padsOfRef.get(pad.ref, ())) > self.RING_PADS and prefix not in self.CONNECTOR_PREFIXES
+
+    def isExposedPad(self, pad):
+        """A chip's centre pad: inside its pin ring and large."""
+        if not self.isRingChip(pad) or pad.poly.area < 1.0:
+            return False
+        if pad.ref not in self.hulls:
+            self.hulls[pad.ref] = unary_union([q.poly for q in self.padsOfRef[pad.ref]]).convex_hull
+        return self.hulls[pad.ref].buffer(-0.3).contains(Point(pad.center))
+
+    def routeToPour(self, conn, target, winPads=(1.0, 2.5, 5.0)):
+        """Join a pad the pour does not reach to `target` (board raster of stitched pour on
+        the pad's layer) with a short track on that layer. True when done."""
+        sp = self.sp
+        layer = conn.a.side
+        rule = self.ruleForConn(conn)
+        srcItems = self.padItems(conn.a)
+        if not srcItems:
+            return False
+        for wp in winPads:
+            win = sp.winFor(conn.a.poly.bounds, wp)
+            i0, j0, i1, j1 = win
+            cost, viaok, wideOk, _ = self.buildCost(conn, rule, win, [layer], srcItems, [], False, 0.0)
+            src = self.endpointCells(srcItems, [layer], win, cost)
+            dst = target[i0:i1, j0:j1][None] & (cost >= 0) & ~src
+            if not src.any() or not dst.any():
+                continue
+            cells, _ = self.runKernel(conn, cost, np.zeros_like(viaok), wideOk,
+                                      np.flatnonzero(src).astype(np.int32), dst.astype(np.uint8), None,
+                                      win, [layer], None, False)
+            if cells is None:
+                continue
+            res = dict(cells=cells, terminalVia=False, srcItems=srcItems, dstItems=[], rule=rule, win=win)
+            items = self.buildItems(conn, res, self.nextRid)
+            if not items or any(self.check(it) for it in items):
+                continue
+            r = self.commit(conn, res, items)
+            r.nodes.append(("plane", conn.net))   # the pour it reaches is stitched to the plane
+            return True
+        return False
+
+    def viaInPad(self, conn):
+        """A plane via inside the (exposed) pad itself. True when one fits."""
+        pad, net = conn.a, conn.net
+        rule = self.rules[net]
+        room = pad.poly.buffer(-(rule.viaDia / 2 + 0.05))
+        if room.is_empty:
+            return False
+        minx, miny, maxx, maxy = room.bounds
+        pts = [pad.center] + [(x, y) for x in np.arange(minx, maxx + 1e-9, 0.2)
+                              for y in np.arange(miny, maxy + 1e-9, 0.2) if room.contains(Point(x, y))]
+        pts.sort(key=lambda p: math.dist(p, pad.center))
+        own = {it.iid for it in self.padItems(pad)}
+        for pt in pts[:40]:
+            if not room.contains(Point(pt)):
+                continue
+            rid = self.nextRid
+            via = self.viaItem(net, pt, rule, rid)
+            if self.check(via, ignore=own):
+                continue
+            self.nextRid += 1
+            self.sp.add(via)
+            self.netItems.setdefault(via.net, set()).add(via.iid)
+            self.routes[rid] = Route(rid, conn, [via.iid], [("pad", pad.pid), ("plane", net)], set())
+            conn.routed, conn.rid = True, rid
+            return True
+        return False
 
     def placePlaneVia(self, pts, net="GND"):
         """Put a plane via at the first of pts that passes the exact check."""
