@@ -8,7 +8,7 @@ from dataclasses import replace
 import pcbnew
 from shapely.geometry import LineString, Point
 
-from boardModel import KICAD_LAYERS
+from boardModel import KICAD_LAYERS, fillZones
 
 NM = 1e6
 
@@ -17,7 +17,10 @@ def v2(p):
     return pcbnew.VECTOR2I(int(round(p[0] * NM)), int(round(p[1] * NM)))
 
 
-def writeItem(board, netInfo, it):
+def writeItem(board, netInfo, it, free=False):
+    """free: a via that no track or pad of its net touches (stitching, a return via):
+    marked so in KiCad, which otherwise hands such a via the net of whatever plane it
+    meets (a ground stitching via would come back as a supply via)."""
     if it.kind == "track":
         t = pcbnew.PCB_TRACK(board)
         t.SetStart(v2(it.pts[0]))
@@ -31,6 +34,7 @@ def writeItem(board, netInfo, it):
         t.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
         t.SetWidth(int(round(it.width * NM)))
         t.SetDrill(int(round(it.drill * NM)))
+        t.SetIsFree(free)
     else:
         return None
     t.SetNet(netInfo)
@@ -51,7 +55,7 @@ def writeRoutes(board, router):
             it = router.sp.items[iid]
             if it.kind == "track":
                 tracks.append((r, it))
-            elif writeItem(board, nets[r.conn.net], it) is not None:
+            elif writeItem(board, nets[r.conn.net], it, free=r.conn.kind == "stitch") is not None:
                 count[it.kind] += 1
     ends = defaultdict(list)
     for _, it in tracks:
@@ -90,13 +94,15 @@ def addPlanes(board, outline, planes, removeIslands=True):
         z.SetIslandRemovalMode(pcbnew.ISLAND_REMOVAL_MODE_ALWAYS if removeIslands
                                else pcbnew.ISLAND_REMOVAL_MODE_NEVER)
         board.Add(z)
-    pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+    fillZones(board)
     return added
 
 
 def runDrc(boardPath, outJson):
+    # refilled, as a person checks it: the verdict must not depend on how the fill saved
+    # in the file came about
     subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-error",
-                    "--severity-warning", "-o", outJson, boardPath], check=True,
+                    "--severity-warning", "--refill-zones", "-o", outJson, boardPath], check=True,
                    capture_output=True)
     with open(outJson) as f:
         return json.load(f)

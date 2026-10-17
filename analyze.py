@@ -20,6 +20,13 @@ Per board:
               sideways and carries on, within 1 mm), steps (any track piece under
               0.5 mm between two bends), and the share of track ends on SMD pads that
               land on the pad's centre
+  vias        (craft) micro-stubs: track pieces under 0.3 mm that join a track to a via
+              of their net (the via should sit on the track's end); close pairs:
+              vias of one net (ground left out) under 1 mm apart
+  stitching   pieces of outer ground pour (0.25 mm2 or more) with fewer than two ground
+              vias or through-hole ground pads, and with none. Run it on a board whose
+              zones are filled the way KiCad fills them (kicad-cli pcb drc
+              --refill-zones --save-board)
 
     kicad-python analyze.py <board.kicad_pcb> --facing [REF,REF...]
 
@@ -251,7 +258,7 @@ def tidiness(board):
     centred = onPad = 0
     for fp in board.GetFootprints():
         for pad in fp.Pads():
-            if pad.GetAttribute() != pcbnew.PAD_ATTRIB_SMD:
+            if pad.GetAttribute() not in (pcbnew.PAD_ATTRIB_SMD, pcbnew.PAD_ATTRIB_CONN):
                 continue
             poly = polySetToShapely(pad.GetEffectivePolygon(pad.GetLayer()))
             c = pad.GetCenter()
@@ -318,10 +325,54 @@ def pinFacing(board, refs=None, minPads=5, maxNetPads=6):
     return out
 
 
+def viaJoins(board, plane="GND"):
+    vias = {}
+    for t in board.GetTracks():
+        if t.GetClass() == "PCB_VIA" and t.GetNetname() != plane:
+            p = t.GetPosition()
+            vias.setdefault(t.GetNetname(), []).append((p.x / NM, p.y / NM))
+    micro = 0
+    for t in board.GetTracks():
+        if t.GetClass() != "PCB_TRACK" or t.GetLength() / NM >= 0.3:
+            continue
+        ends = [(t.GetStart().x / NM, t.GetStart().y / NM), (t.GetEnd().x / NM, t.GetEnd().y / NM)]
+        if any(math.dist(e, v) < 1e-3 for e in ends for v in vias.get(t.GetNetname(), ())):
+            micro += 1
+    pairs = sum(1 for vs in vias.values() for i, a in enumerate(vs) for b in vs[i + 1:]
+                if math.dist(a, b) < 1.0)
+    return dict(microStubs=micro, closeViaPairs=pairs)
+
+
+def stitching(board, net="GND", minArea=0.25):
+    anchors = [Point(t.GetPosition().x / NM, t.GetPosition().y / NM) for t in board.GetTracks()
+               if t.GetClass() == "PCB_VIA" and t.GetNetname() == net]
+    anchors += [Point(p.GetPosition().x / NM, p.GetPosition().y / NM) for fp in board.GetFootprints()
+                for p in fp.Pads() if p.GetNetname() == net and p.GetAttribute() == pcbnew.PAD_ATTRIB_PTH]
+    under, bare, total = 0, 0, 0
+    for z in board.Zones():
+        if z.GetNetname() != net or z.GetIsRuleArea():
+            continue
+        for ln in OUTER:
+            lid = board.GetLayerID(ln)
+            if not z.IsOnLayer(lid):
+                continue
+            fill = polySetToShapely(z.GetFilledPolysList(lid))
+            for piece in getattr(fill, "geoms", [fill]) if fill is not None else []:
+                if piece.area < minArea:
+                    continue
+                total += 1
+                near = piece.buffer(0.35)
+                n = sum(1 for a in anchors if near.contains(a))
+                under += n < 2
+                bare += n == 0
+    return dict(pieces=total, underTwoVias=under, noVia=bare)
+
+
 def analyze(path, plane="GND"):
     b = pcbnew.LoadBoard(path)
     return dict(direction=direction(b), vias=vias(b, plane), reference=reference(b, plane),
-                pairs=pairs(b), pourGaps=pourGaps(b), tidiness=tidiness(b))
+                pairs=pairs(b), pourGaps=pourGaps(b), tidiness=tidiness(b), viaJoins=viaJoins(b, plane),
+                stitching=stitching(b, plane))
 
 
 if __name__ == "__main__":
