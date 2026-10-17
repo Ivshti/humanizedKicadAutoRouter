@@ -211,15 +211,16 @@ LAYER_BY_NAME = {"F.Cu": F, "In1.Cu": IN1, "In2.Cu": IN2, "B.Cu": B}
 
 
 def existingCopper(board):
-    """The board's tracks [(net, layer, p1, p2, width)] (an arc as two chords) and vias
-    [(net, p, dia, drill)], in mm, plus the uuids of all of them."""
+    """The board's tracks [(net, layer, p1, p2, width, uuid)] (an arc as two chords) and vias
+    [(net, p, dia, drill, uuid)], in mm, plus the uuids of all of them."""
     tracks, vias, uuids = [], [], set()
     mm = lambda v: (v.x / NM, v.y / NM)
     for t in board.GetTracks():
-        uuids.add(t.m_Uuid.AsString())
+        uid = t.m_Uuid.AsString()
+        uuids.add(uid)
         net = t.GetNetname()
         if t.GetClass() == "PCB_VIA":
-            vias.append((net, mm(t.GetPosition()), t.GetWidth(pcbnew.F_Cu) / NM, t.GetDrill() / NM))
+            vias.append((net, mm(t.GetPosition()), t.GetWidth(pcbnew.F_Cu) / NM, t.GetDrill() / NM, uid))
             continue
         layer = LAYER_BY_NAME.get(t.GetLayerName())
         if layer is None:
@@ -227,9 +228,9 @@ def existingCopper(board):
         w = t.GetWidth() / NM
         if t.GetClass() == "PCB_ARC":
             a, m, b = mm(t.GetStart()), mm(t.GetMid()), mm(t.GetEnd())
-            tracks += [(net, layer, a, m, w), (net, layer, m, b, w)]
+            tracks += [(net, layer, a, m, w, uid), (net, layer, m, b, w, uid)]
         else:
-            tracks.append((net, layer, mm(t.GetStart()), mm(t.GetEnd()), w))
+            tracks.append((net, layer, mm(t.GetStart()), mm(t.GetEnd()), w, uid))
     return tracks, vias, uuids
 
 

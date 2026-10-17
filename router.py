@@ -152,6 +152,7 @@ class Conn:
     deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
     layerLock: int = -1       # the only layer this connection may use (-1: any)
     viaGapMm: float = -1.0    # a fanout's via-to-pad gap when not fanoutViaGapMm (-1)
+    thin: bool = False        # a plane fanout that did not fit at its pad's width: signal width
 
 
 @dataclass
@@ -192,6 +193,7 @@ class Router:
         self.asForeign = False     # while True, new track items belong to no net (see trackItem)
         self.entryWide = False     # set by entryLegs: its legs are checked at the full width
         self.existing = {}         # rid (< 0) -> (net, nodes): copper that was on the board
+        self.existingItems = {}    # rid (< 0) -> its items
         self.padsOfRef = {}
         for pad in model.pads:
             self.padsOfRef.setdefault(pad.ref, []).append(pad)
@@ -236,6 +238,15 @@ class Router:
         """Net rule, widened to carry the connection's current (IPC-2221, outer copper) and
         allowed to neck to the size of the pads it lands on."""
         base = self.rules[conn.net]
+        if conn.b is None and conn.kind == "gnd" and not conn.thin \
+                and conn.net not in self.outerPourNets:
+            # a fanout to a supply plane is a short power link: the net's power width, as
+            # wide as its pad's narrow side allows (a 0.3 mm pin gets 0.3, not the signal
+            # width). Ground fanouts stay thin: there are many of them, in the densest
+            # places, and the pour around them carries the current anyway
+            pw = base.width if self.powerClass(conn.net) else self.k.powerWidth["Rail"]
+            w = max(base.narrow, min(pw, padMinDim(conn.a)))
+            return NetRule(w, w, base.clearance, base.viaDia, base.viaDrill, base.cls)
         if conn.amps <= 0:
             if conn.net in self.flowNets:  # a tap on a planned power net carries nothing
                 return NetRule(base.narrow, base.narrow, base.clearance, base.viaDia,
@@ -1233,17 +1244,21 @@ class Router:
         routes of their net may join them. Each connected piece of it is a pseudo-route
         (negative id) that joins the pads it touches, and the plane when it holds a via."""
         items = []
-        for net, layer, p1, p2, w in tracks:
+        for t in tracks:
+            net, layer, p1, p2, w = t[:5]
             nid = self.netId.get(net, HARD)
             r = w / 2 * CIRC
             geom = LineString([p1, p2]).buffer(r, 16) if p1 != p2 else Point(p1).buffer(r, 16)
             cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
             items.append(Item(0, nid, "track", (layer,), geom, cl, width=w, pts=(p1, p2), tag="existing"))
-        for net, p, dia, drill in vias:
+            items[-1].uuid = t[5] if len(t) > 5 else None
+        for v in vias:
+            net, p, dia, drill = v[:4]
             nid = self.netId.get(net, HARD)
             cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
             items.append(Item(0, nid, "via", tuple(range(NLAYERS)), Point(p).buffer(dia / 2 * CIRC, 16), cl,
                               width=dia, pts=(p,), drill=drill, tag="existing"))
+            items[-1].uuid = v[4] if len(v) > 4 else None
         for it in items:
             self.sp.add(it)
             self.netItems.setdefault(it.net, set()).add(it.iid)
@@ -1287,7 +1302,25 @@ class Router:
                 m.route = rid
             if net is not None:
                 self.existing[rid] = (net, nodes)
+                self.existingItems[rid] = members
         return len(items)
+
+    def padlessPieces(self):
+        """Pieces of existing copper of a net other than the poured ground that touch none
+        of their net's pads (a via and a stub left where a part used to be, an orphan
+        track): rids. A ground piece without a pad is a stitching via."""
+        return [rid for rid, (net, nodes) in self.existing.items()
+                if net not in self.outerPourNets and not any(n[0] == "pad" for n in nodes)]
+
+    def dropExisting(self, rid):
+        """Take a piece of existing copper out of the model; returns its board uuids."""
+        uuids = set()
+        for it in self.existingItems.pop(rid, []):
+            self.sp.remove(it.iid)
+            self.netItems.get(it.net, set()).discard(it.iid)
+            uuids.add(it.uuid)
+        self.existing.pop(rid, None)
+        return uuids
 
     # ---- via tidying ---------------------------------------------------------------------
     def swapItems(self, r, old, new):
@@ -2155,7 +2188,16 @@ class Router:
 
     # ---- one connection ----------------------------------------------------------------
     def route(self, conn, layers, winPads=(2.0, 6.0, 25.0), negotiate=False, viaMm=None):
-        """Route conn; returns ('ok', route) | ('fail', None) | ('conflict', victims)."""
+        """Route conn; returns ('ok', route) | ('fail', None) | ('conflict', victims). A
+        plane fanout that does not fit at its pad's width is tried once more thin."""
+        st, payload = self.routeOnce(conn, layers, winPads, negotiate, viaMm)
+        if st == "fail" and conn.b is None and conn.kind == "gnd" and not conn.thin \
+                and conn.net not in self.outerPourNets:   # only a supply fanout is drawn wide
+            conn.thin = True
+            st, payload = self.routeOnce(conn, layers, winPads, negotiate, viaMm)
+        return st, payload
+
+    def routeOnce(self, conn, layers, winPads, negotiate, viaMm):
         if self.connected(conn):
             conn.routed = True
             return "ok", None

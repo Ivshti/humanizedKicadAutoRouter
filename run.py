@@ -191,6 +191,34 @@ def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=
     return nT, nV + nSt, nSt, stranded
 
 
+def staleCopper(board, router):
+    """Pieces of the board's own copper that serve nothing: they touch none of their net's
+    pads and no zone of their net on an outer layer (a via and a stub on a plane where a
+    part used to be, an orphan track). KiCad's DRC does not flag a via on a plane. rids."""
+    fills = {}
+    for z in board.Zones():
+        if z.GetIsRuleArea():
+            continue
+        for layer, lid in ((F, pcbnew.F_Cu), (B, pcbnew.B_Cu)):
+            if z.IsOnLayer(lid):
+                g = polySetToShapely(z.GetFilledPolysList(lid))
+                if g is not None:
+                    key = (z.GetNetname(), layer)
+                    fills[key] = g if key not in fills else fills[key].union(g)
+    out = []
+    for rid in router.padlessPieces():
+        net = router.existing[rid][0]
+        live = False
+        for m in router.existingItems[rid]:
+            for layer in ((m.layers[0],) if m.kind == "track" else (F, B)):
+                g = fills.get((net, layer))
+                if g is not None and m.geom.intersects(g):
+                    live = True
+        if not live:
+            out.append(rid)
+    return out
+
+
 def pourTargets(board, router, net="GND"):
     """{layer: board raster} of the outer pour pieces of `net` that hold a via or a
     through-hole pad of it (stitched to the plane), from the board's current fill."""
@@ -489,6 +517,9 @@ def main():
                     help="blocks: only the wiring inside functional blocks and GND fanouts; the "
                          "links between blocks are left to you")
     ap.add_argument("--nets", help="comma-separated net names or globs: route only these")
+    ap.add_argument("--drop-stale", action="store_true",
+                    help="with --keep-copper: remove the board's copper that touches none of its "
+                         "net's pads (left where a part used to be); without it, it is only listed")
     ap.add_argument("--stitch-only", action="store_true",
                     help="route nothing: keep the board's copper, add return vias beside its signal "
                          "vias and stitch its outer ground pours to the plane")
@@ -545,6 +576,20 @@ def main():
         keepZones = [z for z in board.Zones() if not z.GetIsRuleArea()]
         log(f"existing copper kept: {len(tracks)} tracks, {len(vias)} vias, {len(keepZones)} zones "
             f"({router.loadExisting(tracks, vias)} fixed items)")
+        stale = staleCopper(board, router)
+        if stale:
+            where = []
+            for rid in stale:
+                its = router.existingItems[rid]
+                p = its[0].pts[0]
+                where.append(f"{router.existing[rid][0]} at ({p[0]:.2f}, {p[1]:.2f}): "
+                             f"{sum(1 for i in its if i.kind == 'track')} tracks, "
+                             f"{sum(1 for i in its if i.kind == 'via')} vias")
+            if args.drop_stale:
+                for rid in stale:
+                    keepTracks -= router.dropExisting(rid)
+            log(f"copper touching no pad of its net ({'removed' if args.drop_stale else 'kept; --drop-stale removes it'}): "
+                + "; ".join(where))
     flows = []
     if args.flows:
         with open(args.flows) as f:

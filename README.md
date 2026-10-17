@@ -73,6 +73,7 @@ Options:
 | `--keep-copper` | keep every track, via and zone already on the board and route only what is missing; see [Routing part of a board](#routing-part-of-a-board) |
 | `--route blocks` | route only the wiring inside functional blocks and the ground fanouts; the links between blocks are left to you |
 | `--nets A,B*` | route only these nets (names or wildcards) |
+| `--drop-stale` | with `--keep-copper`: remove the board's copper that touches none of its net's pads and no pour of its net (a via and a stub left where a part used to be); without it, such copper is only listed in the log |
 | `--stitch-only` | route nothing: keep the board's copper, add return vias beside its signal vias and stitch its outer ground pours to the plane |
 
 Knobs worth knowing:
@@ -246,7 +247,9 @@ It follows the order a person uses:
    anchors a block, and each passive joins the block it is most tied to.
    Wiring between two blocks becomes a bundle.
 3. **RF first, then each block's own wiring.** Short, local, on the side the
-   parts sit on. Ground pads of capacitors and chips get a fanout via to the
+   parts sit on. A fanout to a supply plane is drawn as wide as the net's power width
+   and its pad's narrow side allow (a 0.3 mm pin gets a 0.3 mm track), and thin
+   only where nothing wider fits. Ground pads of capacitors and chips get a fanout via to the
    plane, with bare board between the via and every pad: on the far side of a
    small part, and inside the pin ring of a chip, out of the way of the wiring
    that arrives at its pins. Other ground pads take the pour.
@@ -360,6 +363,10 @@ $KPY run.py myboard.kicad_pcb --out routed/ --keep-copper --route blocks --knob 
 - With `--keep-copper`, ground is poured only on outer layers that have no
   ground zone of your own; your zones and the new ones are stitched as above.
   Pairs that already have copper of yours are not length-matched.
+- Copper of yours that no longer touches any pad of its net (after you moved
+  a part) is listed in the log; `--drop-stale` removes it, so the router does
+  not have to route around dead copper. KiCad's DRC does not flag a via that
+  sits on a plane, so it is easy to miss.
 - `--stitch-only` routes nothing at all: it adds return vias beside your
   signal vias and stitches your outer ground pours, then reports the ground
   pads the pour does not reach.
