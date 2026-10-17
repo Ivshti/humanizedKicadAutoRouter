@@ -1008,6 +1008,26 @@ class Router:
         out.sort(key=lambda e: e[0])
         return out
 
+    def slideOnto(self, conn, layer, pts, track, rule):
+        """A run that ends inside another track's copper but off its centreline (no leg
+        long enough fitted) is slid along its own last piece onto that centreline: KiCad
+        joins a track end to another track only there. Returns the points (unchanged when
+        the slid piece does not fit)."""
+        if len(pts) < 2:
+            return pts
+        p, prev = pts[-1], pts[-2]
+        if LineString(track.pts).distance(Point(p)) < 1e-4:
+            return pts
+        h = self.heading(prev, p)
+        best = None
+        for d, q in self.octilinearHits(prev, *track.pts):
+            if self.heading(prev, q) == h and (best is None or abs(math.dist(prev, q) - math.dist(prev, p))
+                                               < abs(math.dist(prev, best) - math.dist(prev, p))):
+                best = q
+        if best is None or math.dist(prev, best) < 1e-6 or not self.segOk(conn, layer, prev, best, rule.narrow, rule):
+            return pts
+        return pts[:-1] + [best]
+
     def entryLegs(self, conn, layer, p, items, rule):
         """Points that take a route end on to the centre of its pad (or the centreline of
         the track / the via it lands on), straight or with one bend, and the item it lands
@@ -1076,6 +1096,8 @@ class Router:
                 e, owner = self.entryLegs(conn, layer, pts[0], res["srcItems"], rule)
                 res["srcOwner"] = owner
                 onTrack[0] = owner is not None and owner.kind == "track"
+                if onTrack[0] and not e:
+                    pts = self.slideOnto(conn, layer, pts[::-1], owner, rule)[::-1]
                 pts = e[::-1] + pts
                 wide = [self.entryWide] * len(e) + wide
             if ri == len(runs) - 1 and not res["terminalVia"]:
@@ -1083,6 +1105,8 @@ class Router:
                 e, owner = self.entryLegs(conn, layer, pts[-1], res["dstItems"], rule)
                 res["dstOwner"] = owner
                 onTrack[1] = owner is not None and owner.kind == "track"
+                if onTrack[1] and not e:
+                    pts = self.slideOnto(conn, layer, pts, owner, rule)
                 pts = pts + e
                 wide = wide + [self.entryWide] * len(e)
             raw = list(pts)
@@ -1404,11 +1428,13 @@ class Router:
                     v = via.pts[0]
                     if len(chain) == 1 and math.dist(end, ctr) < 1e-4 and self.octilinear(ctr, v):
                         continue
-                    other = B if layer == F else F
-                    tails = self.tracksAt(r, v, other)
-                    if any(len(self.tracksAt(r, v, other, {t.iid})) > 1 for t in tails):
+                    # the route carries on from the via on whichever layers it does (the
+                    # other outer layer, or an inner signal layer): each of those tails is
+                    # drawn again from the moved via on its own layer
+                    tails = [(t, l2) for l2 in self.allLayers if l2 != layer for t in self.tracksAt(r, v, l2)]
+                    if any(len(self.tracksAt(r, v, l2, {t.iid})) > 1 for t, l2 in tails):
                         continue
-                    farEnds = [t.pts[1] if math.dist(t.pts[0], v) < 1e-4 else t.pts[0] for t in tails]
+                    farEnds = [t.pts[1] if math.dist(t.pts[0], v) < 1e-4 else t.pts[0] for t, _ in tails]
                     oldPieces = len(chain) + len(tails)
                     minx, miny, maxx, maxy = pad.poly.bounds
                     axis = ((1, 0), (-1, 0)) if maxx - minx >= maxy - miny else ((0, 1), (0, -1))
@@ -1427,26 +1453,26 @@ class Router:
                             new = [self.viaItem(c.net, nv, rule, rid),
                                    self.trackItem(c.net, layer, ctr, nv, chain[0].width, rule.clearance, rid)]
                             ok = True
-                            for t, fe in zip(tails, farEnds):
+                            for (t, l2), fe in zip(tails, farEnds):
                                 legs = None
                                 for corner in self.legs(nv, fe):
                                     path = [nv, fe] if corner is None else [nv, corner, fe]
-                                    if all(a == b or not self.check(self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid),
+                                    if all(a == b or not self.check(self.trackItem(c.net, l2, a, b, t.width, rule.clearance, rid),
                                                                      ignore={via.iid, t.iid}) for a, b in zip(path, path[1:])):
                                         legs = path
                                         break
                                 if legs is None:
                                     ok = False
                                     break
-                                new += [self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid)
+                                new += [self.trackItem(c.net, l2, a, b, t.width, rule.clearance, rid)
                                         for a, b in zip(legs, legs[1:]) if a != b]
                             if not ok or len(new) - 1 > oldPieces:
                                 continue
-                            ignore = {via.iid} | {t.iid for t in chain} | {t.iid for t in tails}
+                            ignore = {via.iid} | {t.iid for t in chain} | {t.iid for t, _ in tails}
                             if any(self.check(it, ignore=ignore) for it in new) or self.viaSpacing(new + [
                                     self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via" and i != via.iid]):
                                 continue
-                            self.swapItems(r, [via] + chain + tails, new)
+                            self.swapItems(r, [via] + chain + [t for t, _ in tails], new)
                             moved += 1
                             done = True
                             break
