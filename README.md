@@ -151,15 +151,28 @@ check the following.
    widths, clearances and via sizes, and the net-class patterns all come from
    it. A `.kicad_dru` with custom rules is copied along and is honoured by the
    final DRC.
-3. **A 4-layer stack-up.** Layers are outer top, two inner, outer bottom.
-   Signals and power are routed on the outer layers only.
+3. **4, 6, 8 or more copper layers.** An inner layer with a copper zone of
+   yours on it is a plane; every other inner layer carries signals and power,
+   like the outer layers. The log's `stack:` line shows what it assumed, for
+   example `F.Cu signal / In1.Cu plane GND / In2.Cu signal / In3.Cu signal /
+   In4.Cu plane GND / B.Cu signal`. Vias go through the whole board; blind and
+   buried vias are not used.
 4. **Planes.** Copper zones you have drawn on the inner layers are kept exactly
    as they are: a solid ground plane, or a ground plane with a power pour on
-   the other inner layer, for example. Pads of a plane's net over the plane get
+   another inner layer, for example. Pads of a plane's net over the plane get
    a fanout via to it; pads outside a partial plane are wired to the net like
-   any other. If the board has no inner zones, both inner layers become solid
-   ground. Zones on the outer layers are removed with the rest of the copper
-   and poured again as ground; a power pour you had there comes back as
+   any other. If the board has no inner zones at all, ground goes on a standard
+   stack, so that every signal layer sits next to a plane:
+
+   | layers | stack (S signal, G ground) |
+   |---|---|
+   | 4 | S / G / G / S |
+   | 6 | S / G / S / S / G / S |
+   | 8 | S / G / S / G / G / S / G / S |
+
+   Draw your own inner zones if you want power planes or a different stack.
+   Zones on the outer layers are removed with the rest of the copper and
+   poured again as ground; a power pour you had there comes back as
    overlapping wide tracks (step 9 below).
 5. **Ground is the net called `GND`.** It gets the outer pours, return vias and
    the stitching via field.
@@ -330,7 +343,10 @@ Signal tracks use the width of your Default net class.
 
 ## House rules it follows
 
-- Inner layers carry nothing but your planes (ground, if you drew none).
+- An inner plane layer carries nothing but its plane. Each signal layer has a
+  main direction: the outer layers run opposite diagonals, and inner signal
+  layers alternate horizontal and vertical, starting along the board's long
+  side, so neighbouring signal layers cross at right angles.
 - No copper of another net under the antenna or under module and connector
   bodies on their side.
 - No via touches any SMD pad, and a ground fanout via keeps 0.25 mm of bare
@@ -433,19 +449,23 @@ Numbers are from the reference board, compared with the same board routed by han
   half to two-thirds coupled, like the hand-routed board. The long CAN pair
   varies from run to run (20–55%). Lengths are matched by serpentines; a pair
   with no straight run left to bend can stay a millimetre or two apart.
-- **4-layer boards with a `GND` net.** Two-layer and six-layer boards need
+- **Boards with a `GND` net and at least 4 layers.** Two-layer boards need
   changes.
+- **No BGA escape planning.** A fine-pitch BGA's inner balls need a via per
+  ball, placed between the balls, that the router does not plan; on a board
+  with one, some connections to its inner balls stay unrouted.
 - **Run time** is 6–10 minutes on the reference board. Most of it is push and
   shove, and it depends on how crowded the board is.
-- **Memory.** Everything is rasterised at 0.025 mm over the whole board, so
-  memory grows with board area: about 2.2 GB peak on the 88 × 70 mm reference
-  board, about 3.2 GB on a 133 × 81 mm one. Route one board at a time.
+- **Memory.** Everything is rasterised at 0.025 mm over the whole board and
+  every copper layer, so memory grows with board area and layer count: about
+  2.2 GB peak on the 88 × 70 mm 4-layer reference board, about 3.2 GB on a
+  133 × 81 mm 4-layer one. Route one board at a time.
 - **Runs are not deterministic.** Most of the variation comes from push and
   shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left
   unconnected.
-- **Inner layers carry only planes.** A board that routes power on an inner
-  layer, rather than pouring it, gets that power routed on the outer layers.
+- **An inner layer with any zone is a plane.** A small local pour on an inner
+  layer makes that whole layer a plane for the router.
 
 ---
 
