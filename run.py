@@ -22,12 +22,16 @@ import numpy as np
 import pcbnew
 from shapely.geometry import Point
 
-from boardModel import (B, F, IN1, IN2, boardPlanes, existingCopper, innerPlaneFills, loadModel,
+from boardModel import (B, F, LAYER_NAMES, PHYSICAL, boardPlanes, existingCopper, innerPlaneFills, loadModel,
+                        planeLayersOf,
                         polySetToShapely, readSkewRules, ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from router import Knobs, Router
 from strategy import followLeaders, pairPartners, phaseOrder, plan
+
+
+SIGNAL_LAYERS = [F, B]   # set from the router's stack in main()
 
 
 def layersFor(c):
@@ -37,7 +41,7 @@ def layersFor(c):
         return [c.layerLock]
     if c.strict:
         return [c.prefLayer]
-    return [F, B]
+    return list(SIGNAL_LAYERS)
 
 
 def winPadsFor(c):
@@ -169,8 +173,8 @@ def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=
         return nT, nV, 0, []
     planes = [(l, "GND", True) for l, kl in ((F, pcbnew.F_Cu), (B, pcbnew.B_Cu))
               if not any(z.GetNetname() == "GND" and z.IsOnLayer(kl) for z in keepZones)]
-    if innerGnd:
-        planes += [(IN1, "GND", True), (IN2, "GND", True)]
+    if innerGnd:   # the board has no inner planes: ground on the default stack's plane layers
+        planes += [(l, "GND", True) for l in sorted(router.planeLayers)]
     # fill with every island kept (the board's own ground zones too), so stitching sees the
     # pieces that would otherwise be removed
     own = [z for z in keepZones if z.GetNetname() == "GND"]
@@ -413,7 +417,7 @@ def audit(router, log, phase):
                 f"parents {sorted(r.parents)} children {sorted(router.children.get(rid, ()))} items {ends}")
     for xy in filter(None, os.environ.get("HR_PROBE", "").split(";")):
         x, y = map(float, xy.split(","))
-        for it in router.sp.query(range(4), (x - 0.05, y - 0.05, x + 0.05, y + 0.05)):
+        for it in router.sp.query(router.allLayers, (x - 0.05, y - 0.05, x + 0.05, y + 0.05)):
             if it.geom.buffer(1e-3).contains(Point(x, y)):
                 r = router.routes.get(it.route)
                 owner = f"{r.conn.net} {r.conn.a.ref}.{r.conn.a.num}->" \
@@ -554,10 +558,12 @@ def main():
     ripCopper(board, keep=boardZones)
     model = loadModel(board, os.path.join(srcDir, name + ".kicad_pro"))
     model.planes = innerPlaneFills(board, boardZones, model.outline) if boardZones else {"GND": None}
+    # an inner layer with a zone of the board's own is a plane; without any, the default stack
+    model.planeLayers = planeLayersOf(boardZones) if boardZones else None
     log(f"model: {len(model.pads)} pads, {len(model.nets)} nets, {len(model.keepouts)} keepouts")
     log("planes: " + ", ".join(f"{n} ({'whole board' if f is None else f'{f.area:.0f} mm2'})"
                                for n, f in model.planes.items())
-        + ("" if boardZones else " (none on the board: ground on both inner layers)"))
+        + ("" if boardZones else " (none on the board: ground on the default stack's plane layers)"))
     knobs = Knobs()
     for kv in args.knob:
         key, value = kv.split("=", 1)
@@ -567,6 +573,10 @@ def main():
         setattr(knobs, key, (value.lower() in ("1", "true", "yes")) if isinstance(cur, bool) else type(cur)(value))
         log(f"knob {key} = {getattr(knobs, key)}")
     router = Router(model, knobs, log)
+    SIGNAL_LAYERS[:] = router.signalLayers
+    log("stack: " + " / ".join(
+        f"{LAYER_NAMES[l]} " + ("plane " + "+".join(sorted(router.planeLayers[l])) if l in router.planeLayers
+                                else "signal") for l in PHYSICAL))
     log(f"space: {router.sp.W}x{router.sp.H} cells @ {router.k.grid} mm")
     keepZones, keepTracks = boardZones, set()
     if args.keep_copper:

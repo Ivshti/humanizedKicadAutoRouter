@@ -18,9 +18,9 @@ from shapely.geometry import LineString, Point, box
 from shapely.ops import unary_union
 
 import native
-from boardModel import B, F, IN1, IN2
+from boardModel import B, F, KICAD_LAYERS, LAYER_NAMES, PHYSICAL, defaultPlaneLayers
 from native import edt
-from space import HARD, NLAYERS, Item, Space
+from space import HARD, Item, Space
 
 # shapely's round shapes are polygons inside the true circle; scale them so the polygon
 # lies outside it and every clearance it passes holds for the real round copper
@@ -172,7 +172,9 @@ class Router:
         self.log = log
         self.kernel = native.kernel
         dc = model.classes["Default"].clearance
-        self.sp = Space(model.outline, self.k.grid, self.k.margin, model.edgeClearance, dc)
+        self.NL = len(KICAD_LAYERS)
+        self.allLayers = tuple(range(self.NL))
+        self.sp = Space(model.outline, self.k.grid, self.k.margin, model.edgeClearance, dc, self.NL)
         self.sp.defaultClearance = dc
         self.netId = {n: i + 1 for i, n in enumerate(sorted(model.netClass))}
         self.netName = {i: n for n, i in self.netId.items()}
@@ -184,12 +186,26 @@ class Router:
         self.children = {}
         self.netItems = {}
         self.flowNets = set()      # power nets whose current is planned from flows
-        self.hist = np.zeros((NLAYERS, self.sp.H, self.sp.W), np.float32)
+        self.hist = np.zeros((self.NL, self.sp.H, self.sp.W), np.float32)
         self.stats = {"searches": 0, "searchS": 0.0, "costS": 0.0, "commitS": 0.0}
         self.corridors = None      # Corridors planner, once the bundle phase starts
-        # each outer layer's main diagonal (corridors.py axis numbering); the other diagonal
-        # costs extra on it, so the two layers run their long wiring crosswise
+        # the stack: inner layers that hold a plane (the board's own zones, else the default
+        # stack) stay planes, every other layer carries signals
+        planeLayers = getattr(model, "planeLayers", None)
+        if planeLayers is None:
+            planeLayers = {l: {"GND"} for l in defaultPlaneLayers(self.NL)}
+        self.planeLayers = planeLayers
+        self.signalLayers = [l for l in PHYSICAL if l not in planeLayers]   # stack order
+        # each signal layer's main direction (corridors.py axis numbering): the outer layers
+        # run opposite diagonals, the inner signal layers alternate horizontal and vertical
+        # starting along the board's long side; running along the opposite axis costs extra
         self.mainAxis = {F: 3, B: 1}
+        minx, miny, maxx, maxy = model.outline.bounds
+        axis = 0 if maxx - minx >= maxy - miny else 2
+        for l in self.signalLayers:
+            if l not in (F, B):
+                self.mainAxis[l] = axis
+                axis = 2 - axis
         self.asForeign = False     # while True, new track items belong to no net (see trackItem)
         self.entryWide = False     # set by entryLegs: its legs are checked at the full width
         self.existing = {}         # rid (< 0) -> (net, nodes): copper that was on the board
@@ -289,7 +305,7 @@ class Router:
         for (x, y, r, hnet) in self.m.holes:
             geom = Point(x, y).buffer(r * CIRC, 16)
             hid = self.netId[hnet] if hnet else HARD
-            it = Item(0, hid, "hole", tuple(range(NLAYERS)), geom, 0.0, pts=((x, y),), drill=2 * r)
+            it = Item(0, hid, "hole", self.allLayers, geom, 0.0, pts=((x, y),), drill=2 * r)
             sp.add(it)
             win, mask = sp.rasterMask(geom)
             if mask.size:
@@ -298,10 +314,10 @@ class Router:
             if hc > 0 and hid == HARD:
                 win, mask = sp.rasterMask(geom, hc)
                 i0, j0, i1, j1 = win
-                for l in range(NLAYERS):
+                for l in range(self.NL):
                     sp.occ[l, i0:i1, j0:j1][mask & (sp.occ[l, i0:i1, j0:j1] == 0)] = HARD
                     sp.fixed[l, i0:i1, j0:j1][mask & (sp.fixed[l, i0:i1, j0:j1] == 0)] = HARD
-        edge = Item(0, HARD, "edge", tuple(range(NLAYERS)), self.m.outline.boundary, 0.0)
+        edge = Item(0, HARD, "edge", self.allLayers, self.m.outline.boundary, 0.0)
         sp.add(edge)
         for ko in self.m.keepouts:
             it = Item(0, HARD, "keepout", tuple(ko.layers), ko.poly, 0.0,
@@ -332,7 +348,7 @@ class Router:
         """Human conventions as rasters: no foreign copper under module/antenna bodies,
         keep GND thermal spokes free, and a static distance-to-hole field."""
         sp, k = self.sp, self.k
-        self.bodyKeep = np.zeros((NLAYERS, sp.H, sp.W), bool)
+        self.bodyKeep = np.zeros((self.NL, sp.H, sp.W), bool)
         self.bodyViaKeep = np.zeros((sp.H, sp.W), bool)
         self.bodies = []
         for fp in self.m.footprints.values():
@@ -352,7 +368,7 @@ class Router:
             i0, j0, i1, j1 = win
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
             self.bodyViaKeep[i0:i1, j0:j1] |= mask
-        self.thermalCost = np.zeros((NLAYERS, sp.H, sp.W), np.float32)
+        self.thermalCost = np.zeros((self.NL, sp.H, sp.W), np.float32)
         for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
             if not pad.smd:
                 continue
@@ -511,8 +527,8 @@ class Router:
                 c[other[li] & ~own[li]] *= k.hugMult
             if pair is not None:
                 c[pair[0][li]] *= k.pairMult
-            if conn.corridor is not None and l in (F, B):
-                inside = self.corridors.fine(conn.corridor, 0 if l == F else 1, win)
+            if conn.corridor is not None and l in self.corridors.index:
+                inside = self.corridors.fine(conn.corridor, self.corridors.index[l], win)
                 c[~inside & ~escape] *= k.corridorOut
             if soft is not None:
                 c[soft] *= (1.0 + k.negotiatePenalty)
@@ -801,13 +817,17 @@ class Router:
             cells.append((layers[li], i + win[0], j + win[1], bool(wideOk[li, i, j])))
         return cells, terminalVia
 
+    @staticmethod
+    def layerName(l):
+        return LAYER_NAMES[l]
+
     def layerDir(self, layers):
         """Extra cost per unit length along each axis, per search layer: the diagonal that
         is the other outer layer's main direction."""
         out = np.zeros((len(layers), 4), np.float32)
         for li, l in enumerate(layers):
             if l in self.mainAxis:
-                out[li, 4 - self.mainAxis[l]] = self.k.againstCost
+                out[li, (self.mainAxis[l] + 2) % 4] = self.k.againstCost
         return out
 
     # ---- geometry ----------------------------------------------------------------------
@@ -852,7 +872,7 @@ class Router:
 
     def viaItem(self, net, p, rule, rid):
         geom = Point(p).buffer(rule.viaDia / 2 * CIRC, 16)
-        return Item(0, self.netId[net], "via", tuple(range(NLAYERS)), geom, rule.clearance,
+        return Item(0, self.netId[net], "via", self.allLayers, geom, rule.clearance,
                     width=rule.viaDia, pts=(p,), drill=rule.viaDrill, route=rid)
 
     def check(self, it, ignore=()):
@@ -1256,7 +1276,7 @@ class Router:
             net, p, dia, drill = v[:4]
             nid = self.netId.get(net, HARD)
             cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
-            items.append(Item(0, nid, "via", tuple(range(NLAYERS)), Point(p).buffer(dia / 2 * CIRC, 16), cl,
+            items.append(Item(0, nid, "via", self.allLayers, Point(p).buffer(dia / 2 * CIRC, 16), cl,
                               width=dia, pts=(p,), drill=drill, tag="existing"))
             items[-1].uuid = v[4] if len(v) > 4 else None
         for it in items:

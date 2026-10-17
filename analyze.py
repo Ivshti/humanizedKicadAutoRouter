@@ -43,7 +43,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from boardModel import polySetToShapely  # noqa: E402
 
 NM = 1e6
-OUTER = {"F.Cu": "In1.Cu", "B.Cu": "In2.Cu"}
+OUTER = ("F.Cu", "B.Cu")
 
 
 def layerCopper(board, layerName):
@@ -119,7 +119,10 @@ def reference(board, plane):
                 own.setdefault(pad.GetNetname(), []).append(pad.GetPosition())
     own = {n: np.array([(p.x / NM, p.y / NM) for p in ps]) for n, ps in own.items()}
     out = {}
-    for ln, ref in OUTER.items():
+    n = board.GetCopperLayerCount()
+    # each outer layer's reference plane is the inner layer next to it
+    refs = {"F.Cu": "In1.Cu", "B.Cu": f"In{n - 2}.Cu"} if n >= 4 else {}
+    for ln, ref in refs.items():
         fill = planeFill(board, ref, plane)
         lid = board.GetLayerID(ln)
         total = bad = 0.0
