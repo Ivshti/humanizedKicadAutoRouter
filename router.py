@@ -655,8 +655,11 @@ class Router:
                 if inner.is_empty:
                     inner = Point(item.pad.center).buffer(sp.g * 0.8)
                 cache[key] = sp.rasterMask(inner)
-            else:  # land on a pad: anywhere on its copper
-                cache[key] = self.cachedMask(item, "copper")
+            else:  # land on a pad: anywhere on its copper, a little in from the edge, so an
+                # end on the pad's rim is inside KiCad's outline too (ours is rounded outward)
+                land = item.geom.buffer(-0.03)
+                win, mask = sp.rasterMask(land) if not land.is_empty else (None, np.zeros(0, bool))
+                cache[key] = (win, mask) if mask.size and mask.any() else self.cachedMask(item, "copper")
         return cache[key]
 
     @staticmethod
@@ -1065,7 +1068,9 @@ class Router:
                 continue
             if it.kind == "pad":
                 c = it.pad.center
-                if c == p:
+                if c == p or not it.geom.contains(Point(c)):
+                    # already there, or a pad with no copper at its centre (a ring around a
+                    # microphone's sound port): the end stays where it landed, on the copper
                     return [], it
                 # the last leg along the pad's long axis, as a person draws it, at full
                 # width unless the pad is narrower than the track (then at the pad's width,
@@ -1447,7 +1452,13 @@ class Router:
             if c.kind not in ("sig", "pwr") or c.b is None or self.children.get(rid) or r.paired:
                 continue
             rule = self.ruleForConn(c)
+            own = set(r.items)
             for via in [self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via"]:
+                # a via that joins copper outside its own route directly (a pad or another
+                # route's track on some layer) stays where it is: moving it would lose that
+                if any(o.iid not in own and o.net == via.net and o.kind in ("pad", "track", "via")
+                       and o.geom.intersects(via.geom) for o in self.sp.query(self.allLayers, via.geom.bounds)):
+                    continue
                 for layer in (F, B):
                     st = self.stubToPad(r, via, layer, maxLen)
                     if st is None:
