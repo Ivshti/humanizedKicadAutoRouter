@@ -1,9 +1,12 @@
 """Write routes and planes into a pcbnew board, fill zones, run DRC."""
 import json
+import math
 import subprocess
-from collections import Counter
+from collections import Counter, defaultdict
+from dataclasses import replace
 
 import pcbnew
+from shapely.geometry import LineString, Point
 
 from boardModel import KICAD_LAYERS
 
@@ -36,13 +39,33 @@ def writeItem(board, netInfo, it):
 
 
 def writeRoutes(board, router):
+    """Write every route. A track that another route's track ends on the middle of is
+    written in pieces split at that joint, so every join is a shared end point: KiCad does
+    not always join a track end to the middle of another track (seen on a 45-degree one
+    on a 6-layer board, where it reported the joining piece as dangling)."""
     nets = board.GetNetsByName()
     count = Counter()
+    tracks = []
     for r in router.routes.values():
         for iid in r.items:
             it = router.sp.items[iid]
-            if writeItem(board, nets[r.conn.net], it) is not None:
+            if it.kind == "track":
+                tracks.append((r, it))
+            elif writeItem(board, nets[r.conn.net], it) is not None:
                 count[it.kind] += 1
+    ends = defaultdict(list)
+    for _, it in tracks:
+        ends[(it.net, it.layers[0])] += list(it.pts)
+    for r, it in tracks:
+        a, b = it.pts
+        seg = LineString([a, b]) if a != b else None
+        cuts = sorted({p for p in ends[(it.net, it.layers[0])]
+                       if seg is not None and math.dist(p, a) > 1e-4 and math.dist(p, b) > 1e-4
+                       and seg.distance(Point(p)) < 1e-4}, key=lambda p: math.dist(a, p))
+        pts = [a] + cuts + [b]
+        for p, q in zip(pts, pts[1:]):
+            if writeItem(board, nets[r.conn.net], replace(it, pts=(p, q))) is not None:
+                count["track"] += 1
     return count["track"], count["via"]
 
 

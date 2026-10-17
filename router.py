@@ -1111,10 +1111,6 @@ class Router:
                 wide = wide + [self.entryWide] * len(e)
             raw = list(pts)
             pts, widths = self.pullTight(conn, layer, pts, wide, rule, onTrack=onTrack)
-            if ri == 0:
-                res["srcEnd"] = pts[0]
-            if ri == len(runs) - 1:
-                res["dstEnd"] = pts[-1]
             if os.environ.get("HR_TRACE_NET") == conn.net:
                 self.log(f"trace {conn.net} {conn.a.ref}.{conn.a.num}->{conn.b.ref + '.' + conn.b.num if conn.b else 'plane'} "
                          f"layer {layer} run {ri}: raw {raw} -> {pts} widths {widths}")
@@ -1165,25 +1161,7 @@ class Router:
             self.children.setdefault(p, set()).add(rid)
         conn.routed = True
         conn.rid = rid
-        for owner, end in ((res.get("srcOwner"), res.get("srcEnd")), (res.get("dstOwner"), res.get("dstEnd"))):
-            if owner is not None and end is not None and owner.kind == "track":
-                self.splitAt(owner, end)
         return r
-
-    def splitAt(self, it, q):
-        """A route that ends on the middle of another route's track splits that track
-        there, so the join is a shared end point: KiCad does not always join a track end
-        to the middle of another track (seen on a 45 degree one). Copper that was on the
-        board already is left as it was drawn."""
-        r = self.routes.get(it.route)
-        if r is None or it.iid not in self.sp.items or it.iid not in r.items:
-            return
-        a, b = it.pts
-        if min(math.dist(a, q), math.dist(b, q)) < 1e-4 or LineString([a, b]).distance(Point(q)) > 1e-4:
-            return
-        layer = it.layers[0]
-        self.swapItems(r, [it], [self.trackItem(self.netName[it.net], layer, a, q, it.width, it.clearance, r.rid),
-                                 self.trackItem(self.netName[it.net], layer, q, b, it.width, it.clearance, r.rid)])
 
     def rip(self, rid, ripped=None):
         """Remove a route and everything that hangs off it; returns the connections freed."""
@@ -1456,8 +1434,22 @@ class Router:
                     tails = [(t, l2) for l2 in self.allLayers if l2 != layer for t in self.tracksAt(r, v, l2)]
                     if any(len(self.tracksAt(r, v, l2, {t.iid})) > 1 for t, l2 in tails):
                         continue
-                    farEnds = [t.pts[1] if math.dist(t.pts[0], v) < 1e-4 else t.pts[0] for t, _ in tails]
-                    oldPieces = len(chain) + len(tails)
+                    # each tail as its chain of up to three unbranched pieces from the via, so
+                    # the moved via can join it further along instead of doubling back
+                    tailChains = []
+                    for t, l2 in tails:
+                        pieces, pts, cur = [t], [v], v
+                        while True:
+                            last = pieces[-1]
+                            nxt = last.pts[1] if math.dist(last.pts[0], cur) < 1e-4 else last.pts[0]
+                            pts.append(nxt)
+                            cur = nxt
+                            more = self.tracksAt(r, cur, l2, {p.iid for p in pieces})
+                            if len(pieces) >= 3 or len(more) != 1 or self.padUnder(c.net, l2, cur) is not None:
+                                break
+                            pieces.append(more[0])
+                        tailChains.append((l2, pieces, pts))
+                    oldPieces = len(chain) + sum(len(ps) for _, ps, _ in tailChains)
                     minx, miny, maxx, maxy = pad.poly.bounds
                     axis = ((1, 0), (-1, 0)) if maxx - minx >= maxy - miny else ((0, 1), (0, -1))
                     diag = ((1, 1), (1, -1), (-1, 1), (-1, -1))
@@ -1475,26 +1467,34 @@ class Router:
                             new = [self.viaItem(c.net, nv, rule, rid),
                                    self.trackItem(c.net, layer, ctr, nv, chain[0].width, rule.clearance, rid)]
                             ok = True
-                            for (t, l2), fe in zip(tails, farEnds):
-                                legs = None
-                                for corner in self.legs(nv, fe):
-                                    path = [nv, fe] if corner is None else [nv, corner, fe]
-                                    if all(a == b or not self.check(self.trackItem(c.net, l2, a, b, t.width, rule.clearance, rid),
-                                                                     ignore={via.iid, t.iid}) for a, b in zip(path, path[1:])):
-                                        legs = path
+                            dropped = []
+                            for l2, pieces, pts in tailChains:
+                                w = pieces[0].width
+                                ign = {via.iid} | {p.iid for p in pieces}
+                                found = None
+                                for j in range(len(pts) - 1, 0, -1):   # the farthest point first
+                                    for corner in self.legs(nv, pts[j]):
+                                        path = [nv, pts[j]] if corner is None else [nv, corner, pts[j]]
+                                        if all(a == b or not self.check(self.trackItem(c.net, l2, a, b, w, rule.clearance, rid),
+                                                                         ignore=ign) for a, b in zip(path, path[1:])):
+                                            found = (j, path)
+                                            break
+                                    if found:
                                         break
-                                if legs is None:
+                                if found is None:
                                     ok = False
                                     break
-                                new += [self.trackItem(c.net, l2, a, b, t.width, rule.clearance, rid)
-                                        for a, b in zip(legs, legs[1:]) if a != b]
+                                j, path = found
+                                dropped += pieces[:j]
+                                new += [self.trackItem(c.net, l2, a, b, w, rule.clearance, rid)
+                                        for a, b in zip(path, path[1:]) if a != b]
                             if not ok or len(new) - 1 > oldPieces:
                                 continue
-                            ignore = {via.iid} | {t.iid for t in chain} | {t.iid for t, _ in tails}
+                            ignore = {via.iid} | {t.iid for t in chain} | {p.iid for _, ps, _ in tailChains for p in ps}
                             if any(self.check(it, ignore=ignore) for it in new) or self.viaSpacing(new + [
                                     self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via" and i != via.iid]):
                                 continue
-                            self.swapItems(r, [via] + chain + [t for t, _ in tails], new)
+                            self.swapItems(r, [via] + chain + dropped, new)
                             moved += 1
                             done = True
                             break
