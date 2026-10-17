@@ -69,7 +69,30 @@ Options:
 | `--out DIR` | where the routed copy goes (required) |
 | `--flows FILE` | how much current each power net carries; see below |
 | `--minutes N` | time budget, default 25; it stops negotiating when this runs out |
-| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=3`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py`. Useful ones: `viaMm` (what a via costs, in mm of track; 5), `topDiagonal` (`/`, `\` or `auto`), `pairSkewMm`, `signalWidth` (0 = your Default net class width) |
+| `--knob NAME=VALUE` | override one routing setting, e.g. `--knob viaMm=3`; repeatable. The settings and their defaults are listed in `Knobs` at the top of `router.py`; the useful ones are in the table below |
+| `--keep-copper` | keep every track, via and zone already on the board and route only what is missing; see [Routing part of a board](#routing-part-of-a-board) |
+| `--route blocks` | route only the wiring inside functional blocks and the ground fanouts; the links between blocks are left to you |
+| `--nets A,B*` | route only these nets (names or wildcards) |
+| `--stitch-only` | route nothing: keep the board's copper, add return vias beside its signal vias and stitch its outer ground pours to the plane |
+
+Knobs worth knowing:
+
+| knob | default | what it does |
+|---|---|---|
+| `viaMm` | 5 | what a via costs, in mm of track |
+| `topDiagonal` | `auto` | the top layer's main diagonal: `/`, `\` or `auto` |
+| `pairSkewMm` | 1.5 | length mismatch allowed in a differential pair with no skew rule of its own |
+| `signalWidth` | 0 | signal track width; 0 uses your Default net class |
+| `neckMm` | 0.5 | a power track narrows only this close to a pad of its own that is narrower than the track; anywhere else it keeps its width or the connection is reported unrouted |
+| `fanoutParts` | `caps-ics` | which ground pads get their own via: `all`; `caps-ics` (capacitors and multi-pin parts other than connectors; a resistor's, diode's or connector's ground pad takes the pour, and gets a via only when the pour misses it); or `none` (every ground pad takes the pour, stitching feeds the pour, and a pad the pour misses is reported, not given a via). Pads of other plane nets (a supply plane) always get their via, since nothing pours them on the outer layers |
+| `fanoutViaGapMm` | 0.25 | bare board kept between a ground fanout via and any pad edge, its own pad included |
+| `fanoutInsideMult` | 3 | how much more a fanout pays where its via does not belong: inside a small part's outline (so the via lands on the far side from its other pads), or in the band just outside a chip's ring of pins, where the wiring to its other pins arrives (so the via goes inside the ring, under the body) |
+| `thermalHard` | `true` | other nets may not cross the path of a ground pad's thermal spokes (except within 0.3 mm of their own pads); `false` makes it only a cost (`thermalPenalty`) |
+| `stitch` | `true` | stitch the outer ground pours to the plane, and add return vias |
+| `stitchPitchMm` | 4 | spacing of the stitching grid in open pour |
+| `stitchPerIsland` | 2 | vias (or through-hole ground pads) every piece of outer pour gets, so none hangs on pad thermals alone |
+| `stitchPadGapMm` | 0.5 | bare board between a stitching or return via and any pad |
+| `blockLayer` | `free` | `own`: wiring inside a block stays on its parts' layer, and the other outer layer is left for the links between blocks. A connection that cannot be routed that way may use the other layer |
 
 Progress is printed as it goes. The last line is the DRC result, for example
 `DRC: 0 violations {}, 0 unconnected`.
@@ -223,9 +246,13 @@ It follows the order a person uses:
    anchors a block, and each passive joins the block it is most tied to.
    Wiring between two blocks becomes a bundle.
 3. **RF first, then each block's own wiring.** Short, local, on the side the
-   parts sit on. Each ground pad gets its fanout via to the plane.
+   parts sit on. Ground pads of capacitors and chips get a fanout via to the
+   plane, with bare board between the via and every pad: on the far side of a
+   small part, and inside the pin ring of a chip, out of the way of the wiring
+   that arrives at its pins. Other ground pads take the pour.
 4. **Power.** Biggest current first, as trunks from source to consumers.
-   High-current paths avoid changing layers.
+   High-current paths avoid changing layers. A power track keeps its width all
+   the way into its pad; it narrows only to land on a pad narrower than itself.
 5. **Pick each layer's direction, then plan corridors.** Before the first
    track, it decides which diagonal the top layer's long runs follow and gives
    the bottom the other one, so the two layers run crosswise and long buses
@@ -271,13 +298,15 @@ It follows the order a person uses:
     lays overlapping thick tracks. A track that ends on a pad grows no wider
     than that pad.
 11. **Return vias.** Every signal via without a ground via within 1.5 mm gets
-    one beside it, so the return current can change planes where the signal
+    one within 2 mm, so the return current can change planes where the signal
     changes layers.
 12. **Planes and stitching.** Ground is poured on the outer layers (and on the
-    inner ones when the board has no planes of its own) and stitched with a
-    via grid. A piece of the outer pour that nothing connects would be removed
-    and leave a hole in the ground; each one with room for a via gets one. A
-    ground pad whose thermal spokes end up blocked is given a solid connection.
+    inner ones when the board has no planes of its own). Then the pour itself
+    is stitched to the plane: every piece of it gets two vias (a through-hole
+    ground pad counts as one), so none hangs on pad thermals alone, and open
+    pour gets a via every 4 mm. Stitching vias keep 0.5 mm of bare board to
+    every pad and stay out of keep-out areas. A ground pad whose thermal spokes
+    end up blocked is given a solid connection.
 13. **Check and repair.** KiCad's DRC runs on the saved board. A ground pad
     that the pour could not reach is then given a fanout via after all, pushing
     other wiring aside, and the board is written and checked again. The last
@@ -300,11 +329,41 @@ Signal tracks use the width of your Default net class.
 - Inner layers carry nothing but your planes (ground, if you drew none).
 - No copper of another net under the antenna or under module and connector
   bodies on their side.
-- No via touches any SMD pad.
+- No via touches any SMD pad, and a ground fanout via keeps 0.25 mm of bare
+  board to every pad.
+- Nothing of another net crosses the path of a ground pad's thermal spokes, so
+  the pour reaches the pad.
 - Pad-specific clearances (for example around fiducials) and pads with
   different shapes per layer are respected.
 - Every track and via is checked against exact geometry before it is
   placed. KiCad's DRC then has the final word.
+
+---
+
+## Routing part of a board
+
+You can let the router finish a board you have started, or do the tedious
+part of one you will finish yourself:
+
+```sh
+$KPY run.py myboard.kicad_pcb --out routed/ --keep-copper --route blocks --knob blockLayer=own
+```
+
+- `--keep-copper` keeps everything you drew: tracks, vias and zones. Nothing
+  new may cross it, and push and shove never moves it. New tracks may join it.
+  A connection your copper already makes is not routed again.
+- `--route blocks` routes only the short wiring inside each functional block
+  (an IC or module with its passives) and the ground fanouts. The buses
+  between blocks are left for you.
+- `--nets` limits the run to the nets you name.
+- With `--keep-copper`, ground is poured only on outer layers that have no
+  ground zone of your own; your zones and the new ones are stitched as above.
+  Pairs that already have copper of yours are not length-matched.
+- `--stitch-only` routes nothing at all: it adds return vias beside your
+  signal vias and stitches your outer ground pours, then reports the ground
+  pads the pour does not reach.
+- The DRC report then counts what was left for you as unconnected. The log
+  says how many connections that is.
 
 ---
 
@@ -335,6 +394,14 @@ signal/power) and how many segments are not 0/45/90°.
 
 All three are handy for comparing against a hand-routed version of the same
 board.
+
+For placement rather than routing, `analyze.py myboard.kicad_pcb --facing`
+(optionally followed by `U4,U5`) scores how well each part's signal pins face
+the parts they connect to, from -1 to 1, and what the score would be with the
+part rotated 90, 180 or 270 degrees. A part that would score clearly better
+rotated is flagged. It agrees with a hand decision on the reference signer
+board: a secure element rotated so its I²C pins face the microcontroller went
+from -0.49 to +0.57.
 
 When a result has an unconnected item or a dangling track, run with
 `HR_AUDIT=1` in the environment: after each phase the router checks its own
@@ -369,6 +436,8 @@ Numbers are from the reference board, compared with the same board routed by han
   shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left
   unconnected.
+- **Inner layers carry only planes.** A board that routes power on an inner
+  layer, rather than pouring it, gets that power routed on the outer layers.
 
 ---
 

@@ -5,7 +5,7 @@ from collections import Counter
 
 import pcbnew
 
-from boardModel import KICAD_LAYERS, polySetToShapely
+from boardModel import KICAD_LAYERS
 
 NM = 1e6
 
@@ -44,23 +44,6 @@ def writeRoutes(board, router):
             if writeItem(board, nets[r.conn.net], it) is not None:
                 count[it.kind] += 1
     return count["track"], count["via"]
-
-
-def floatingIslands(board, layer, net, anchors):
-    """Filled pieces of the net's pour on `layer` that touch none of `anchors` (shapely
-    shapes of the net's own pads, tracks and vias on that layer)."""
-    lid = KICAD_LAYERS[layer]
-    out = []
-    for z in board.Zones():
-        if z.GetNetname() != net or not z.IsOnLayer(lid) or z.GetIsRuleArea():
-            continue
-        fill = polySetToShapely(z.GetFilledPolysList(lid))
-        if fill is None:
-            continue
-        for piece in getattr(fill, "geoms", [fill]):
-            if not any(piece.intersects(a) for a in anchors):
-                out.append(piece)
-    return out
 
 
 def addPlanes(board, outline, planes, removeIslands=True):

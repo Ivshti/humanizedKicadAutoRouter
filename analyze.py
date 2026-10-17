@@ -20,6 +20,14 @@ Per board:
               sideways and carries on, within 1 mm), steps (any track piece under
               0.5 mm between two bends), and the share of track ends on SMD pads that
               land on the pad's centre
+
+    kicad-python analyze.py <board.kicad_pcb> --facing [REF,REF...]
+
+  facing      placement, not routing: for each part with five or more pads, how well
+              its signal pins face the parts they connect to (-1..1; 1 = every pin's
+              row faces its partner), and the score it would get rotated by 90, 180
+              and 270 degrees (KiCad's rotation direction) about its own position.
+              Ground and nets with more than six pads are left out.
 """
 import math
 import sys
@@ -256,6 +264,57 @@ def tidiness(board):
                 padEndsCentred=f"{centred}/{onPad}")
 
 
+def pinFacing(board, refs=None, minPads=5, maxNetPads=6):
+    """{ref: {pins, score, rotated: {90: s, 180: s, 270: s}}} (see the module docstring)."""
+    fps = list(board.GetFootprints())
+    byNet = {}
+    for fp in fps:
+        for pad in fp.Pads():
+            c = pad.GetCenter()
+            byNet.setdefault(pad.GetNetname(), []).append((fp.GetReference(), (c.x / NM, c.y / NM)))
+    out = {}
+    for fp in fps:
+        ref = fp.GetReference()
+        pads = list(fp.Pads())
+        if len(pads) < minPads or (refs and ref not in refs):
+            continue
+        pts = [(p.GetCenter().x / NM, p.GetCenter().y / NM) for p in pads]
+        cx, cy = sum(x for x, _ in pts) / len(pts), sum(y for _, y in pts) / len(pts)
+        hx = max(abs(x - cx) for x, _ in pts) or 1e-6
+        hy = max(abs(y - cy) for _, y in pts) or 1e-6
+        pins = []   # (position, outward normal of its row, partner position)
+        for pad, (x, y) in zip(pads, pts):
+            net = pad.GetNetname()
+            others = [q for r, q in byNet.get(net, []) if r != ref]
+            if not net or net == "GND" or not others or len(byNet[net]) > maxNetPads:
+                continue
+            dx, dy = x - cx, y - cy
+            if abs(dx) / hx < 0.3 and abs(dy) / hy < 0.3:
+                continue   # a centre pad faces nowhere
+            n = (math.copysign(1, dx), 0.0) if abs(dx) / hx >= abs(dy) / hy else (0.0, math.copysign(1, dy))
+            partner = min(others, key=lambda q: math.dist(q, (x, y)))
+            pins.append(((x, y), n, partner))
+        if not pins:
+            continue
+        o = fp.GetPosition()
+        ox, oy = o.x / NM, o.y / NM
+
+        def score(deg):
+            t = math.radians(deg)
+            # KiCad's positive rotation is counter-clockwise on screen (y points down)
+            rot = lambda vx, vy: (vx * math.cos(t) + vy * math.sin(t), -vx * math.sin(t) + vy * math.cos(t))
+            total = 0.0
+            for (x, y), n, (px, py) in pins:
+                rx, ry = rot(x - ox, y - oy)
+                nx, ny = rot(*n)
+                vx, vy = px - (ox + rx), py - (oy + ry)
+                L = math.hypot(vx, vy) or 1e-9
+                total += (nx * vx + ny * vy) / L
+            return round(total / len(pins), 2)
+        out[ref] = dict(pins=len(pins), score=score(0), rotated={d: score(d) for d in (90, 180, 270)})
+    return out
+
+
 def analyze(path, plane="GND"):
     b = pcbnew.LoadBoard(path)
     return dict(direction=direction(b), vias=vias(b, plane), reference=reference(b, plane),
@@ -263,6 +322,15 @@ def analyze(path, plane="GND"):
 
 
 if __name__ == "__main__":
+    if "--facing" in sys.argv:
+        i = sys.argv.index("--facing")
+        refs = set(sys.argv[i + 1].split(",")) if len(sys.argv) > i + 1 else None
+        for ref, r in sorted(pinFacing(pcbnew.LoadBoard(sys.argv[1]), refs).items(), key=lambda kv: kv[1]["score"]):
+            best = max(r["rotated"], key=r["rotated"].get)
+            hint = f"  rotate {best}: {r['rotated'][best]:+.2f}" if r["rotated"][best] > r["score"] + 0.2 else ""
+            print(f"{ref:12s} {r['pins']:3d} pins  facing {r['score']:+.2f}  "
+                  + "  ".join(f"{d}: {v:+.2f}" for d, v in r["rotated"].items()) + hint)
+        sys.exit(0)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     plane = sys.argv[sys.argv.index("--plane") + 1] if "--plane" in sys.argv else "GND"
     args = [a for a in args if a != plane]

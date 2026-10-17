@@ -158,7 +158,10 @@ class Space:
         if mask.size == 0:
             return
         i0, j0, i1, j1 = win
-        rasters = [self.occ, self.fixed] if item.kind in ("pad", "hole") else [self.occ]
+        # pads, holes and copper that was already on the board are fixed: negotiation
+        # never rips them
+        fixed = item.kind in ("pad", "hole") or item.tag == "existing"
+        rasters = [self.occ, self.fixed] if fixed else [self.occ]
         for l in item.layers:
             for r in rasters:
                 sub = r[l, i0:i1, j0:j1]

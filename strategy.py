@@ -9,6 +9,7 @@
 4. Phase order: RF (strict), block internals + their GND fanouts, power, bundles.
 """
 import math
+import re
 from collections import defaultdict
 
 from router import Conn
@@ -165,6 +166,29 @@ def linkPairs(conns, partners):
     return n
 
 
+# reference prefixes of parts whose GND pads take the pour rather than a via of their own
+POUR_PREFIXES = {"J", "P", "CN", "CON", "X", "USB", "SW", "S", "TP", "H", "R", "RN", "L", "FB", "D", "LED", "F"}
+
+
+def fanoutWanted(pad, padCount, mode):
+    """Whether a GND pad gets its own fanout via. "all": every one. "caps-ics":
+    capacitors (the via is part of the decoupling loop) and multi-pin parts other than
+    connectors; a resistor's, diode's or connector's GND pad takes the pour."""
+    if mode == "all":
+        return True
+    if mode == "none":
+        return False
+    if mode != "caps-ics":
+        raise ValueError(f"fanoutParts must be 'all', 'caps-ics' or 'none', not {mode!r}")
+    m = re.match(r"[A-Za-z]+", pad.ref)
+    prefix = m.group(0).upper() if m else ""
+    if prefix == "C":
+        return True
+    if prefix in POUR_PREFIXES:
+        return False
+    return padCount > 3
+
+
 def plan(model, router, log=print, flows=()):
     planeNets = router.planeNets
     block = buildBlocks(model, planeNets)
@@ -191,8 +215,11 @@ def plan(model, router, log=print, flows=()):
             over = {p.pid for p in pads if router.onPlane(net, p.center)}
             for p in pads:
                 if p.smd and p.pid in over:
-                    add(net=net, a=p, b=None, kind="gnd", block=block[p.ref], prefLayer=p.side,
-                        strict=False)
+                    c = add(net=net, a=p, b=None, kind="gnd", block=block[p.ref], prefLayer=p.side,
+                            strict=False)
+                    # only a net poured on the outer layers can take a pad without a via
+                    c.deferred = net in router.outerPourNets and not fanoutWanted(
+                        p, len(router.padsOfRef.get(p.ref, ())), router.k.fanoutParts)
             edges = [e for e in edges if e[0].pid not in over or e[1].pid not in over]
         for a, b, d, amps in edges:
             ba, bb = block[a.ref], block[b.ref]
@@ -210,6 +237,9 @@ def plan(model, router, log=print, flows=()):
         if c.bundle and c.kind == "sig":
             bundles[c.bundle].append(c)
     for c in conns:
+        if router.k.blockLayer == "own" and c.kind in ("sig", "pwr") and not c.bundle \
+                and c.a.smd and c.b.smd and c.a.side == c.b.side:
+            c.layerLock = c.a.side   # block wiring stays on its parts' side
         if c.kind in ("sig", "pwr") and c.prefLayer < 0 and c.order <= LONG_MM:
             # block internals stay on the side their parts sit on; long runs pick the
             # layer whose main diagonal suits them (router.mainAxis)

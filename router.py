@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from shapely.geometry import LineString, Point, box
+from shapely.ops import unary_union
 
 import native
 from boardModel import B, F, IN1, IN2
@@ -36,7 +37,9 @@ class Knobs:
     turn90Mm: float = 0.5
     viaMm: float = 5.0
     otherLayerMult: float = 2.5
-    neckMm: float = 1.0          # power tracks may neck down this close to their own pads
+    neckMm: float = 0.5          # a power track may neck down only this close to a pad of its
+                                 # own that is narrower than the track; elsewhere it keeps its
+                                 # width or the route fails
     escapeMm: float = 1.5        # body keep-outs do not apply this close to the route's own pads
     escapeViaMm: float = 4.0     # a bundle member's vias belong this close to its pads (or at
                                  # a planned layer change)
@@ -45,8 +48,26 @@ class Knobs:
     hugMult: float = 0.8         # signals pay this much less one clearance from other wiring
     pairMult: float = 0.3        # a pair's second net pays this much less at the pair gap
     thermalPenalty: float = 2.0  # cost added on GND pads' thermal spoke corridors
+    thermalHard: bool = True     # other nets may not cross those corridors at all (except
+                                 # within 0.3 mm of their own pads, to get out of a pin row)
+    fanoutViaGapMm: float = 0.25 # bare board between a GND fanout via's ring and any pad edge
+    fanoutInsideMult: float = 3.0  # a fanout pays this much more where its via does not belong:
+                                 # inside a small part's outline (via on the far side), or just
+                                 # outside a chip's pin ring (via inside the ring, under the body)
+    fanoutParts: str = "caps-ics"  # which pads of a net poured on the outer layers (GND) get
+                                 # their own via: "all"; "caps-ics" = capacitors and multi-pin
+                                 # parts other than connectors, the rest take the pour and get a
+                                 # via only if the pour misses them; "none" = every pad takes
+                                 # the pour, stitching feeds it and a pad it misses is reported.
+                                 # Pads of plane nets with no outer pour always get their via.
+    blockLayer: str = "free"     # "own": wiring inside a block stays on its parts' layer, the
+                                 # other outer layer is left to the bundles (relaxed only for a
+                                 # connection that cannot be routed that way)
     bodyMinAreaMm2: float = 40.0
     stitchPitchMm: float = 4.0
+    stitch: bool = True          # stitch the outer ground pours to the plane after routing
+    stitchPadGapMm: float = 0.5  # bare board between a stitching or return via and any pad
+    stitchPerIsland: int = 2     # vias (or through-hole pads) every piece of outer pour gets
     ampRiseC: float = 20.0
     outerUm: float = 35.0
     ampMargin: float = 1.08
@@ -128,6 +149,8 @@ class Conn:
     pairLeader: object = None # set on a pair's second net: the first net's connection
     pairMate: object = None   # both nets of a pair: the other one's connection
     pairTried: bool = False   # the pair was already tried together (see Router.routePair)
+    deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
+    layerLock: int = -1       # the only layer this connection may use (-1: any)
 
 
 @dataclass
@@ -166,6 +189,15 @@ class Router:
         # costs extra on it, so the two layers run their long wiring crosswise
         self.mainAxis = {F: 3, B: 1}
         self.asForeign = False     # while True, new track items belong to no net (see trackItem)
+        self.entryWide = False     # set by entryLegs: its legs are checked at the full width
+        self.existing = {}         # rid (< 0) -> (net, nodes): copper that was on the board
+        self.padsOfRef = {}
+        for pad in model.pads:
+            self.padsOfRef.setdefault(pad.ref, []).append(pad)
+        self.hulls = {}
+        # nets the finished board pours on both outer layers (finishBoard): their pads
+        # can be left to the pour
+        self.outerPourNets = {"GND"} & self.planeNets
         self.loadFixed()
 
     # ---- setup ------------------------------------------------------------------------
@@ -318,6 +350,14 @@ class Router:
                     if l in (F, B):
                         self.thermalCost[l, i0:i1, j0:j1][mask] = k.thermalPenalty
         self.holeDist = (edt(sp.holeMask) * sp.g).astype(np.float32)
+        padAll = np.zeros((sp.H, sp.W), bool)
+        for pad in self.m.pads:
+            if F in pad.layers or B in pad.layers:
+                win, mask = sp.rasterMask(pad.poly)
+                if mask.size:
+                    i0, j0, i1, j1 = win
+                    padAll[i0:i1, j0:j1] |= mask
+        self.padEdgeDist = (edt(padAll) * sp.g).astype(np.float32)
         # a plane that does not cover the board: cells where a via reaches it
         self.planeCells = {}
         for net, fill in self.m.planes.items():
@@ -362,6 +402,11 @@ class Router:
                 continue
             for n in r.nodes:
                 union(("route", r.rid), n)
+        for rid, (n, nodes) in self.existing.items():
+            if n == net:
+                find(("route", rid))
+                for nd in nodes:
+                    union(("route", rid), nd)
         return find
 
     def onPlane(self, net, p):
@@ -405,7 +450,14 @@ class Router:
             self.paint(own, win, it)
         padDist = edt(own) * g if own.any() else np.full((h, w), 1e3)
         escape = padDist < k.escapeMm
-        neckZone = padDist < k.neckMm if rule.narrow < rule.width else np.zeros((h, w), bool)
+        # a power track necks only to land on a pad narrower than itself
+        narrowPads = [it for it in ownPads if it.kind == "pad" and padMinDim(it.pad) < rule.width - 1e-6]
+        neckZone = np.zeros((h, w), bool)
+        if rule.narrow < rule.width and narrowPads and k.neckMm > 0:
+            m2 = np.zeros((h, w), bool)
+            for it in narrowPads:
+                self.paint(m2, win, it)
+            neckZone = edt(m2) * g < k.neckMm
         hug = self.hugMasks(conn, rule, win, layers) if conn.kind == "sig" else None
         pair = self.pairBand(conn, rule, win, layers)
         cost = np.empty((len(layers), h, w), np.float32)
@@ -425,6 +477,8 @@ class Router:
             ok &= ~sp.trackKeep[l, i0:i1, j0:j1]
             if not plane:
                 ok &= ~(self.bodyKeep[l, i0:i1, j0:j1] & ~escape)
+                if k.thermalHard:
+                    ok &= ~(self.thermalCost[l, i0:i1, j0:j1] > 0) | (padDist < 0.3)
             mult = 1.0
             if conn.prefLayer >= 0 and l != conn.prefLayer:
                 mult = k.otherLayerMult
@@ -645,15 +699,46 @@ class Router:
         srcIdx = np.flatnonzero(src).astype(np.int32)
         tgt = dst.astype(np.uint8)
         tvia = viaok.copy() if toPlane else None
+        i0, j0, i1, j1 = win
         if tvia is not None and conn.net in self.planeCells:
-            i0, j0, i1, j1 = win
             tvia &= self.planeCells[conn.net][i0:i1, j0:j1]
+        if tvia is not None and conn.kind == "gnd":
+            # a fanout via keeps fanoutViaGapMm of bare board to every pad, its own too,
+            # and lands on the side away from the rest of its part
+            tvia &= self.padEdgeDist[i0:i1, j0:j1] >= rule.viaDia / 2 + k.fanoutViaGapMm + k.grid
+            avoid = self.fanoutAvoid(conn.a, win)
+            if avoid is not None:
+                sub = cost[:, avoid]
+                cost[:, avoid] = np.where(sub > 0, sub * k.fanoutInsideMult, sub)
         cells, terminalVia = self.runKernel(conn, cost, viaok, wideOk, srcIdx, tgt, tvia, win, layers,
                                             viaMm, toPlane)
         if cells is None:
             return None
         return dict(cells=cells, terminalVia=terminalVia, srcItems=srcItems, dstItems=dstItems,
                     rule=rule, win=win)
+
+    RING_PADS = 8   # a part with more pads than this is a chip with a ring of pins
+
+    def fanoutAvoid(self, pad, win):
+        """Window cells a ground fanout from this pad should stay out of, so its via lands
+        where a person puts it: for a small part (passive, transistor) the part's own
+        outline, so the via goes on the far side from its other pads; for a chip with a
+        ring of pins, the band just outside the ring, where the wiring to its other pins
+        arrives, so the via goes inside the ring, under the body. The pad itself is never
+        avoided. None for a one-pad part."""
+        pads = self.padsOfRef.get(pad.ref, [])
+        if len(pads) < 2:
+            return None
+        if pad.ref not in self.hulls:
+            self.hulls[pad.ref] = unary_union([q.poly for q in pads]).convex_hull
+        hull = self.hulls[pad.ref]
+        area = hull.buffer(self.k.escapeMm).difference(hull) if len(pads) > self.RING_PADS else hull
+        geom = area.difference(pad.poly.buffer(self.k.grid))
+        i0, j0, i1, j1 = win
+        out = np.zeros((i1 - i0, j1 - j0), bool)
+        wwin, mask = self.sp.rasterMask(geom)
+        self.blit(out, win, wwin, mask)
+        return out
 
     def runKernel(self, conn, cost, viaok, wideOk, srcIdx, tgt, tvia, win, layers, viaMm, toPlane):
         """The A* call; returns (cells, terminalVia) or (None, False)."""
@@ -849,7 +934,17 @@ class Router:
         for wdt in sorted(set(cands), reverse=True):
             if wdt > rule.narrow and self.segOk(conn, layer, p, q, wdt, rule):
                 return wdt
-        return rule.narrow
+        if self.nearNarrowPad(conn, p, q, rule):
+            return rule.narrow
+        # no reason to neck here: the width stays, and the route's exact check turns the
+        # route down if it does not fit
+        return rule.width
+
+    def nearNarrowPad(self, conn, p, q, rule):
+        """Whether p-q comes within neckMm of an end pad narrower than the track."""
+        seg = LineString([p, q]) if p != q else Point(p)
+        return any(pad is not None and padMinDim(pad) < rule.width - 1e-6
+                   and seg.distance(pad.poly) < self.k.neckMm + 1e-6 for pad in (conn.a, conn.b))
 
     MIN_LEG = 0.1   # mm; KiCad's connectivity ignores a shorter piece at a T junction
 
@@ -884,13 +979,19 @@ class Router:
                 c = it.pad.center
                 if c == p:
                     return [], it
-                # the last leg along the pad's long axis, as a person draws it
+                # the last leg along the pad's long axis, as a person draws it, at full
+                # width unless the pad is narrower than the track (then at the pad's width,
+                # or the narrow width if that does not fit)
                 minx, miny, maxx, maxy = it.pad.poly.bounds
                 axis = (1, 0) if maxx - minx >= maxy - miny else (0, 1)
+                pw = padMinDim(it.pad)
+                ew = rule.width if pw >= rule.width - 1e-6 else max(rule.narrow, pw)
+                wide = ew >= rule.width - 1e-6
                 best = []
                 for corner in self.legs(p, c):
                     path = [p, c] if corner is None else [p, corner, c]
-                    if not self.pathOk(conn, layer, path, rule.narrow, rule):
+                    if not self.pathOk(conn, layer, path, ew, rule) and \
+                            (wide or not self.pathOk(conn, layer, path, rule.narrow, rule)):
                         continue
                     h = self.heading(path[-2], path[-1])
                     along = (abs(h[0]), abs(h[1])) == axis
@@ -898,24 +999,27 @@ class Router:
                         best = path[1:]
                     if along:
                         break
+                self.entryWide = wide
                 return best, it
             if it.kind == "track":
                 # on to the centreline with one leg no shorter than KiCad needs; a point
                 # already inside the copper may stay where it is
                 inside = LineString(it.pts).distance(Point(p)) <= it.width / 2 - 1e-3
+                self.entryWide = True
                 for d, q in self.octilinearHits(p, *it.pts):
                     if d < self.MIN_LEG:
                         continue
-                    if self.segOk(conn, layer, p, q, rule.narrow, rule):
+                    if self.segOk(conn, layer, p, q, rule.width, rule):
                         return [q], it
                 return [], it if inside else None
             if it.kind == "via":
                 q = it.pts[0]
+                self.entryWide = True
                 if q == p:
                     return [], it
                 for corner in self.legs(p, q):
                     path = [p, q] if corner is None else [p, corner, q]
-                    if self.pathOk(conn, layer, path, rule.narrow, rule):
+                    if self.pathOk(conn, layer, path, rule.width, rule):
                         return path[1:], it
                 return [], it
         return [], None
@@ -928,17 +1032,19 @@ class Router:
         for ri, (layer, pts, wide) in enumerate(runs):
             onTrack = [False, False]
             if ri == 0:
+                self.entryWide = False
                 e, owner = self.entryLegs(conn, layer, pts[0], res["srcItems"], rule)
                 res["srcOwner"] = owner
                 onTrack[0] = owner is not None and owner.kind == "track"
                 pts = e[::-1] + pts
-                wide = [False] * len(e) + wide
+                wide = [self.entryWide] * len(e) + wide
             if ri == len(runs) - 1 and not res["terminalVia"]:
+                self.entryWide = False
                 e, owner = self.entryLegs(conn, layer, pts[-1], res["dstItems"], rule)
                 res["dstOwner"] = owner
                 onTrack[1] = owner is not None and owner.kind == "track"
                 pts = pts + e
-                wide = wide + [False] * len(e)
+                wide = wide + [self.entryWide] * len(e)
             raw = list(pts)
             pts, widths = self.pullTight(conn, layer, pts, wide, rule, onTrack=onTrack)
             if os.environ.get("HR_TRACE_NET") == conn.net:
@@ -1110,6 +1216,69 @@ class Router:
                         log(f"audit {phase}: {where} touches only {sorted({(o.kind, o.route, o.tag) for o in touching})}; "
                             f"nodes {r.nodes} parents {sorted(r.parents)}")
         return bad
+
+    # ---- copper already on the board ----------------------------------------------------------
+    def loadExisting(self, tracks, vias):
+        """Tracks [(net, layer, p1, p2, width)] and vias [(net, p, dia, drill)] already on the
+        board, as fixed copper: nothing may cross them, negotiation never rips them, and
+        routes of their net may join them. Each connected piece of it is a pseudo-route
+        (negative id) that joins the pads it touches, and the plane when it holds a via."""
+        items = []
+        for net, layer, p1, p2, w in tracks:
+            nid = self.netId.get(net, HARD)
+            r = w / 2 * CIRC
+            geom = LineString([p1, p2]).buffer(r, 16) if p1 != p2 else Point(p1).buffer(r, 16)
+            cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
+            items.append(Item(0, nid, "track", (layer,), geom, cl, width=w, pts=(p1, p2), tag="existing"))
+        for net, p, dia, drill in vias:
+            nid = self.netId.get(net, HARD)
+            cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
+            items.append(Item(0, nid, "via", tuple(range(NLAYERS)), Point(p).buffer(dia / 2 * CIRC, 16), cl,
+                              width=dia, pts=(p,), drill=drill, tag="existing"))
+        for it in items:
+            self.sp.add(it)
+            self.netItems.setdefault(it.net, set()).add(it.iid)
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for it in items:
+            find(it.iid)
+            if it.net == HARD:
+                continue
+            anchors = [(it.layers[0], q) for q in it.pts] if it.kind == "track" else \
+                [(l, it.pts[0]) for l in it.layers]
+            for l, q in anchors:
+                pt = Point(q)
+                for o in self.sp.query([l], (q[0], q[1], q[0], q[1])):
+                    if o.iid == it.iid or o.net != it.net or not o.geom.buffer(1e-3).contains(pt):
+                        continue
+                    if o.kind == "pad":
+                        parent[find(it.iid)] = find(("pad", o.pad.pid))
+                    elif o.tag == "existing":
+                        parent[find(it.iid)] = find(o.iid)
+        clusters = {}
+        for it in items:
+            clusters.setdefault(find(it.iid), []).append(it)
+        pads = {}
+        for x in list(parent):
+            if isinstance(x, tuple):
+                pads.setdefault(find(x), []).append(x)
+        for n, (root, members) in enumerate(clusters.items(), 1):
+            rid = -n
+            net = self.netName.get(members[0].net)
+            nodes = list(pads.get(root, []))
+            if net in self.planeNets and any(m.kind == "via" and self.onPlane(net, m.pts[0]) for m in members):
+                nodes.append(("plane", net))
+            for m in members:
+                m.route = rid
+            if net is not None:
+                self.existing[rid] = (net, nodes)
+        return len(items)
 
     # ---- via tidying ---------------------------------------------------------------------
     def swapItems(self, r, old, new):
@@ -1694,6 +1863,8 @@ class Router:
             want = extra - added
             if want < 0.05:
                 break
+            if self.joinedByOthers(it, r):
+                continue   # another route joins this piece: bending it would leave that one hanging
             pitch = max(3 * it.width, it.width + it.clearance)
             done = False
             for amp in (amax, amax * 0.6, amax * 0.35):
@@ -1720,6 +1891,13 @@ class Router:
                 if done:
                     break
         return added
+
+    def joinedByOthers(self, it, r):
+        """Whether copper of the same net that is not route r's touches track piece it."""
+        own = set(r.items)
+        return any(o.iid not in own and o.net == it.net and o.kind in ("track", "via")
+                   and o.geom.intersects(it.geom)
+                   for o in self.sp.query(it.layers, it.geom.bounds))
 
     def underBody(self, item, layer):
         """Copper of a route that would sit under a module or antenna body."""
@@ -1817,7 +1995,7 @@ class Router:
         m = k.margin
         ok = sp.foreignDist(nid, None, win, reach=0) >= rv + max(rule.clearance, 0.25) + m
         ok &= ~sp.viaKeep
-        ok &= (edt(sp.smdPad != 0) * sp.g) >= rv + 0.1
+        ok &= self.padEdgeDist >= rv + k.stitchPadGapMm + sp.g
         ok &= self.holeDist >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         ok &= sp.maskDist(sp.viaAt, win, reach=0, pred=lambda a: a != 0) >= rule.viaDrill + 0.6
         return ok
@@ -1856,9 +2034,10 @@ class Router:
         ii, jj, d = ii[keep], jj[keep], d[keep]
         return [sp.toMm(ii[x] + a0, jj[x] + b0) for x in np.argsort(d)[:n]]
 
-    def returnVias(self, net="GND", reach=1.5):
-        """A plane via next to every signal via that has none within reach: the return
-        current of a track that changes layers changes planes there too."""
+    def returnVias(self, net="GND", reach=1.5, placeMm=2.0):
+        """A plane via next to every signal via that has none within reach (placed within
+        placeMm, as near as the pad gap allows): the return current of a track that changes
+        layers changes planes there too."""
         sp = self.sp
         ok = self.stitchMask(net)
         nid = self.netId[net]
@@ -1870,30 +2049,13 @@ class Router:
             x, y = it.pts[0]
             if any(math.dist(g, (x, y)) <= reach for g in gnd):
                 continue
-            pt = self.placePlaneVia(self.nearestOk(ok, x, y, reach, minMm=0.0), net)
+            pt = self.placePlaneVia(self.nearestOk(ok, x, y, placeMm, minMm=0.0), net)
             if pt is not None:
                 gnd.append(pt)
                 i, j = sp.toCell(*pt)
                 r = int(0.9 / sp.g)
                 ok[max(i - r, 0):i + r + 1, max(j - r, 0):j + r + 1] = False
                 added += 1
-        return added
-
-    def stitch(self, net="GND"):
-        """GND via field on a square grid (snapped to the nearest legal spot near each node)."""
-        sp, k = self.sp, self.k
-        ok = self.stitchMask(net)
-        p = k.stitchPitchMm
-        minx, miny, maxx, maxy = self.m.outline.bounds
-        added = 0
-        y = miny + p / 2
-        while y < maxy:
-            x = minx + p / 2
-            while x < maxx:
-                if self.placePlaneVia(self.nearestOk(ok, x, y, p / 3), net) is not None:
-                    added += 1
-                x += p
-            y += p
         return added
 
     def viaSpacing(self, items):
@@ -1939,8 +2101,8 @@ class Router:
                 continue
             if not bad:
                 return "ok", self.commit(conn, res, items)
-            victims = {o.route for o in bad if o.kind in ("track", "via") and o.route}
-            fixedHit = [o for o in bad if o.kind not in ("track", "via")]
+            victims = {o.route for o in bad if o.kind in ("track", "via") and o.route > 0}
+            fixedHit = [o for o in bad if o.kind not in ("track", "via") or o.route < 0]
             if negotiate and victims and not fixedHit:
                 return "conflict", (res, items, victims)
             # raster error against fixed copper: retry with a wider margin

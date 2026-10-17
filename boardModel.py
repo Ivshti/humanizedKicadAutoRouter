@@ -194,15 +194,43 @@ def zoneToKeepout(z):
 INNER_KICAD = (pcbnew.In1_Cu, pcbnew.In2_Cu)
 
 
-def ripCopper(board, keep=()):
-    """Remove every track, via and copper zone except the zones in `keep`; rule areas stay
-    (they are design intent)."""
+def ripCopper(board, keep=(), keepTracks=()):
+    """Remove every track, via and copper zone except the zones in `keep` and the tracks
+    and vias whose uuids are in `keepTracks`; rule areas stay (they are design intent)."""
+    keepTracks = set(keepTracks)
     for t in list(board.GetTracks()):
-        board.Delete(t)
+        if t.m_Uuid.AsString() not in keepTracks:
+            board.Delete(t)
     keep = {z.m_Uuid.AsString() for z in keep}  # wrappers differ per call, uuids do not
     for z in [board.GetArea(i) for i in range(board.GetAreaCount())]:
         if not z.GetIsRuleArea() and z.m_Uuid.AsString() not in keep:
             board.Delete(z)
+
+
+LAYER_BY_NAME = {"F.Cu": F, "In1.Cu": IN1, "In2.Cu": IN2, "B.Cu": B}
+
+
+def existingCopper(board):
+    """The board's tracks [(net, layer, p1, p2, width)] (an arc as two chords) and vias
+    [(net, p, dia, drill)], in mm, plus the uuids of all of them."""
+    tracks, vias, uuids = [], [], set()
+    mm = lambda v: (v.x / NM, v.y / NM)
+    for t in board.GetTracks():
+        uuids.add(t.m_Uuid.AsString())
+        net = t.GetNetname()
+        if t.GetClass() == "PCB_VIA":
+            vias.append((net, mm(t.GetPosition()), t.GetWidth(pcbnew.F_Cu) / NM, t.GetDrill() / NM))
+            continue
+        layer = LAYER_BY_NAME.get(t.GetLayerName())
+        if layer is None:
+            raise ValueError(f"track of {net} on {t.GetLayerName()}: only 4-layer boards are supported")
+        w = t.GetWidth() / NM
+        if t.GetClass() == "PCB_ARC":
+            a, m, b = mm(t.GetStart()), mm(t.GetMid()), mm(t.GetEnd())
+            tracks += [(net, layer, a, m, w), (net, layer, m, b, w)]
+        else:
+            tracks.append((net, layer, mm(t.GetStart()), mm(t.GetEnd()), w))
+    return tracks, vias, uuids
 
 
 def boardPlanes(board):
