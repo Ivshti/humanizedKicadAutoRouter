@@ -1111,6 +1111,10 @@ class Router:
                 wide = wide + [self.entryWide] * len(e)
             raw = list(pts)
             pts, widths = self.pullTight(conn, layer, pts, wide, rule, onTrack=onTrack)
+            if ri == 0:
+                res["srcEnd"] = pts[0]
+            if ri == len(runs) - 1:
+                res["dstEnd"] = pts[-1]
             if os.environ.get("HR_TRACE_NET") == conn.net:
                 self.log(f"trace {conn.net} {conn.a.ref}.{conn.a.num}->{conn.b.ref + '.' + conn.b.num if conn.b else 'plane'} "
                          f"layer {layer} run {ri}: raw {raw} -> {pts} widths {widths}")
@@ -1161,7 +1165,25 @@ class Router:
             self.children.setdefault(p, set()).add(rid)
         conn.routed = True
         conn.rid = rid
+        for owner, end in ((res.get("srcOwner"), res.get("srcEnd")), (res.get("dstOwner"), res.get("dstEnd"))):
+            if owner is not None and end is not None and owner.kind == "track":
+                self.splitAt(owner, end)
         return r
+
+    def splitAt(self, it, q):
+        """A route that ends on the middle of another route's track splits that track
+        there, so the join is a shared end point: KiCad does not always join a track end
+        to the middle of another track (seen on a 45 degree one). Copper that was on the
+        board already is left as it was drawn."""
+        r = self.routes.get(it.route)
+        if r is None or it.iid not in self.sp.items or it.iid not in r.items:
+            return
+        a, b = it.pts
+        if min(math.dist(a, q), math.dist(b, q)) < 1e-4 or LineString([a, b]).distance(Point(q)) > 1e-4:
+            return
+        layer = it.layers[0]
+        self.swapItems(r, [it], [self.trackItem(self.netName[it.net], layer, a, q, it.width, it.clearance, r.rid),
+                                 self.trackItem(self.netName[it.net], layer, q, b, it.width, it.clearance, r.rid)])
 
     def rip(self, rid, ripped=None):
         """Remove a route and everything that hangs off it; returns the connections freed."""
