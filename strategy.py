@@ -9,6 +9,7 @@
 4. Phase order: RF (strict), block internals + their GND fanouts, power, bundles.
 """
 import math
+import random
 import re
 from collections import defaultdict
 
@@ -51,9 +52,8 @@ def buildBlocks(model, planeNets):
             else:
                 rest.append(fp)
         pending = rest
-    for fp in pending:  # no signal nets in common with anything: nearest anchor
-        if anchors:
-            block[fp.ref] = min(anchors, key=lambda a: octile(a.pos, fp.pos)).ref
+    for fp in pending:  # no signal nets in common with anything: nearest anchor, or its own
+        block[fp.ref] = min(anchors, key=lambda a: octile(a.pos, fp.pos)).ref if anchors else fp.ref
     return block
 
 
@@ -232,6 +232,11 @@ def plan(model, router, log=print, flows=()):
             if ba != bb:
                 c.bundle = "|".join(sorted((ba, bb)))
 
+    if router.k.seed:
+        # another run of the same board: similar-length connections swap places
+        rng = random.Random(router.k.seed)
+        for c in conns:
+            c.order *= 1 + 0.3 * (rng.random() - 0.5)
     bundles = defaultdict(list)
     for c in conns:
         if c.bundle and c.kind == "sig":

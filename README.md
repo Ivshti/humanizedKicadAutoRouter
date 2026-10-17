@@ -74,7 +74,9 @@ Options:
 | `--route blocks` | route only the wiring inside functional blocks and the ground fanouts; the links between blocks are left to you |
 | `--nets A,B*` | route only these nets (names or wildcards) |
 | `--drop-stale` | with `--keep-copper`: remove the board's copper that touches none of its net's pads and no pour of its net (a via and a stub left where a part used to be); without it, such copper is only listed in the log |
+| `--tidy on\|off\|report\|only` | clean the copper up at the end, the way KiCad's Cleanup Tracks & Vias does (`on`, the default); `report` lists what it would change and changes nothing; `only` routes nothing and just cleans the board's own copper; see [Cleaning up copper](#cleaning-up-copper) |
 | `--stitch-only` | route nothing: keep the board's copper, add return vias beside its signal vias and stitch its outer ground pours to the plane |
+| `--seed N` | run number (default 0). The same board, options, router version and seed give the same result; another seed tries the connections in a slightly different order, and small changes in order can change a dense board's result a lot, so when one disappoints, a few seeds are worth a try |
 
 Knobs worth knowing:
 
@@ -192,7 +194,10 @@ check the following.
     gap from the `.kicad_pro`. Their lengths are matched to the skew budget
     of a `(constraint skew (max …))` rule in the `.kicad_dru` whose condition
     names the pair with `A.inDiffPair('…')`; a pair without such a rule is
-    matched to 1.5 mm (`--knob pairSkewMm=…`).
+    matched to 1.5 mm (`--knob pairSkewMm=…`) when each of its nets runs from
+    one pin to one pin. A pair that also reaches a test point or a second part
+    is not matched without a rule: the branch makes a net longer but not the
+    pair.
 
 Any existing tracks, vias and outer-layer copper pours are removed before
 routing. The router always starts from a clean board, plus your inner planes.
@@ -246,16 +251,16 @@ It follows the order a person uses:
 2. **Find the functional blocks.** Every multi-pin part (IC, module, connector)
    anchors a block, and each passive joins the block it is most tied to.
    Wiring between two blocks becomes a bundle.
-3. **RF first, then each block's own wiring.** Short, local, on the side the
-   parts sit on. A fanout to a supply plane is drawn as wide as the net's power width
+3. **RF first, then each block's own wiring** (a block's differential pairs
+   before the rest of it). Short, local, on the side the parts sit on. A fanout to a supply plane is drawn as wide as the net's power width
    and its pad's narrow side allow (a 0.3 mm pin gets a 0.3 mm track), and thin
    only where nothing wider fits. Ground pads of capacitors and chips get a fanout via to the
    plane, with bare board between the via and every pad: on the far side of a
    small part, and inside the pin ring of a chip, out of the way of the wiring
    that arrives at its pins. Other ground pads take the pour.
 4. **Power.** Biggest current first, as trunks from source to consumers.
-   High-current paths avoid changing layers. A power track keeps its width all
-   the way into its pad; it narrows only to land on a pad narrower than itself.
+   Power paths avoid changing layers. A power track keeps its width all the way
+   into its pad; it narrows only to land on a pad narrower than itself.
 5. **Pick each layer's direction, then plan corridors.** Before the first
    track, it decides which diagonal the top layer's long runs follow and gives
    the bottom the other one, so the two layers run crosswise and long buses
@@ -276,9 +281,12 @@ It follows the order a person uses:
    are a last resort. A differential pair is drawn as one: a single search
    wide enough for both tracks at the pair gap, then split into the two
    tracks, which run side by side, turn together and splay apart just enough
-   at every layer change for their two vias. Where the two pads are on the
-   wrong sides for that (the pair would have to cross), the second net
-   follows the first at the pair gap instead.
+   at every layer change for their two vias. When the cheapest way in would
+   make the two tracks cross (the pads are the other way round for that
+   approach), the pair is searched again so that it leaves or enters its pads
+   head-on from the other side, and the shortest way that keeps the polarity is
+   used. Only when none exists does the second net follow the first at the
+   pair gap.
 7. **Push and shove.** A connection that cannot get through may route across
    others at a price. The ones it crossed are ripped and routed again, and the
    board remembers where the fights were.
@@ -295,11 +303,12 @@ It follows the order a person uses:
    is placed, so a pair in a tight spot may end up matched less closely. A
    pair with no skew rule of its own that is off by several times the default
    budget took two different paths; it is reported and left alone rather than
-   buried under bumps.
+   buried under bumps. So is a pair with no skew rule whose nets branch.
 10. **Power copper.** Every power track is widened to the widest that fits, so
     neighbouring tracks of one net overlap into a small pour, the way a person
     lays overlapping thick tracks. A track that ends on a pad grows no wider
-    than that pad.
+    than that pad. Nets in a net class named `Rail` are light rails and keep
+    their class width, unless `--flows` gives them a current.
 11. **Return vias.** Every signal via without a ground via within 1.5 mm gets
     one within 2 mm, so the return current can change planes where the signal
     changes layers.
@@ -308,10 +317,12 @@ It follows the order a person uses:
     is stitched to the plane: every piece of it gets two vias (a through-hole
     ground pad counts as one), so none hangs on pad thermals alone, and open
     pour gets a via every 4 mm. Stitching vias keep 0.5 mm of bare board to
-    every pad and stay out of every rule area, including ones that only forbid
-    parts (a printed logo under a clear case is no place for a via). A ground pad whose thermal spokes
-    end up blocked is given a solid connection.
-13. **Check and repair.** KiCad's DRC runs on the saved board. A ground pad
+    every pad (0.25 mm for a piece that has no room otherwise) and stay out of
+    every rule area, including ones that only forbid parts (a printed logo under
+    a clear case is no place for a via). A ground pad whose thermal spokes end
+    up blocked is given a solid connection.
+13. **Check and repair.** KiCad's DRC runs on the saved board, with the zones
+    refilled the way KiCad refills them. A ground pad
     that the pour could not reach is then given a fanout via after all, pushing
     other wiring aside, and the board is written and checked again. The last
     DRC result is what is reported.
@@ -320,7 +331,8 @@ Throughout, signal tracks are drawn to run one clearance away from existing
 wiring. Tracks pack together the way a person nudges them, and the space left
 over stays in one piece for the ground pour.
 
-All tracks are horizontal, vertical or 45°. Each piece of a route is pulled
+All tracks are horizontal, vertical or 45°. A via sits where its tracks bend,
+not a short stub away from the bend. Each piece of a route is pulled
 straight after the search: a stair-step the grid produced becomes one straight
 run plus one 45° leg, with the bend placed where the route already turns, and
 every track ends on the centre of its pad, entering along the pad's long axis.
@@ -367,11 +379,46 @@ $KPY run.py myboard.kicad_pcb --out routed/ --keep-copper --route blocks --knob 
   a part) is listed in the log; `--drop-stale` removes it, so the router does
   not have to route around dead copper. KiCad's DRC does not flag a via that
   sits on a plane, so it is easy to miss.
+- Every run records the copper it drew in `myboard.humanrouter.json` next to
+  the routed board. Keep that file beside the board. A later `--keep-copper`
+  run treats the copper it lists as the router's own, as long as it is still
+  where the router left it: it may move it (rip it and route its connections
+  again) when a pair or another connection needs the room. Anything you drew
+  or moved yourself stays fixed.
 - `--stitch-only` routes nothing at all: it adds return vias beside your
   signal vias and stitches your outer ground pours, then reports the ground
   pads the pour does not reach.
 - The DRC report then counts what was left for you as unconnected. The log
   says how many connections that is.
+
+---
+
+## Cleaning up copper
+
+At the end of every run, and on its own with `--tidy only`, the router cleans
+the copper up the way a person does before calling a board done:
+
+- a track lying entirely on another of the same net that is at least as wide
+  (the copper does not change; two runs that share a stretch and then part are
+  left alone);
+- a track lying entirely inside a pad of its net;
+- two tracks of the same width meeting end to end in a straight line, where
+  nothing else joins them: merged into one;
+- a track that runs past a junction and doubles back: cut back to the junction;
+- a track end that touches nothing: removed back to the first junction;
+- a via that touches copper of its net on one layer only;
+- ground tracks that reach no ground pad (a lone ground via is stitching and
+  stays, and so does a track that joins two pieces of pour);
+- copper of another net that touches none of its pads and no pour of it.
+
+The last five only touch nets with nothing left unconnected: on a net that is
+still being routed, a stub is where the next route starts.
+
+Each kind of clean-up is checked with KiCad's DRC before it is kept. If it
+leaves more unconnected items or more copper violations, its edits are tried
+in smaller groups and only the harmless ones are kept; the log names what was
+kept back. `--tidy report` lists every edit and changes nothing, so you can
+review it first.
 
 ---
 
@@ -444,6 +491,10 @@ Numbers are from the reference board, compared with the same board routed by han
   shove.
 - **Never moves parts.** If a placement is unroutable, it reports what is left
   unconnected.
+- **A plane cut in pieces stays cut.** When your own copper cuts a plane in
+  two (with `--keep-copper`, for example a row of vias across a narrow neck),
+  the log warns, and pads tied to different pieces stay apart. Join the pieces
+  on the board.
 - **Inner layers carry only planes.** A board that routes power on an inner
   layer, rather than pouring it, gets that power routed on the outer layers.
 

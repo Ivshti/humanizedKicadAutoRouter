@@ -22,12 +22,13 @@ import numpy as np
 import pcbnew
 from shapely.geometry import Point
 
-from boardModel import (B, F, IN1, IN2, boardPlanes, existingCopper, innerPlaneFills, loadModel,
-                        polySetToShapely, readSkewRules, ripCopper)
+from boardModel import (B, F, IN1, IN2, boardPlanes, existingCopper, fillZones, innerPlaneFills,
+                        loadModel, polySetToShapely, readSkewRules, ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from router import Knobs, Router
 from strategy import followLeaders, pairPartners, phaseOrder, plan
+from tidy import Judge, tidy
 
 
 def layersFor(c):
@@ -48,8 +49,10 @@ def winPadsFor(c):
 
 def viaMmFor(c, k):
     if c.kind == "gnd":
-        return 0.4
-    if c.amps > 1.0:   # a person keeps high-current paths on one layer
+        # a supply-plane fanout would rather share a via of its net a short walk away
+        # than set its own beside it; ground fanouts are cheap (the pour joins them anyway)
+        return 0.4 if c.net == "GND" else 1.5
+    if c.amps > 1.0 or c.kind == "pwr":   # a person keeps power paths on one layer
         return k.viaMm * 4
     return k.viaMm
 
@@ -113,6 +116,9 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     router.corridors = Corridors(router, k.corridorTileMm)
     groups = splitBundles(bundles, block, k.joinMm, k.maxGroup)
     router.corridors.chooseAxes(groups, log)
+    # block wiring (a block's own pairs early), GND and power first; bundles last, a pair
+    # between blocks with its bundle in its corridor (laid first, a long pair took the room
+    # the Nano's power needed: negotiation 59 -> ~150 rounds)
     first = [c for c in order if not (c.bundle and c.kind == "sig")]
     later = [c for c in order if c.bundle and c.kind == "sig"]
     relaxed = 0
@@ -165,7 +171,7 @@ def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=
     ripCopper(board, keep=keepZones, keepTracks=keepTracks)
     nT, nV = writeRoutes(board, router)
     if "GND" not in router.planeNets:
-        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        fillZones(board)
         return nT, nV, 0, []
     planes = [(l, "GND", True) for l, kl in ((F, pcbnew.F_Cu), (B, pcbnew.B_Cu))
               if not any(z.GetNetname() == "GND" and z.IsOnLayer(kl) for z in keepZones)]
@@ -221,7 +227,8 @@ def staleCopper(board, router):
 
 def pourTargets(board, router, net="GND"):
     """{layer: board raster} of the outer pour pieces of `net` that hold a via or a
-    through-hole pad of it (stitched to the plane), from the board's current fill."""
+    through-hole pad of it (stitched to the plane), from the board's current fill, at
+    least 0.8 mm from the net's vias."""
     sp = router.sp
     nid = router.netId[net]
     rv = router.rules[net].viaDia / 2
@@ -244,6 +251,11 @@ def pourTargets(board, router, net="GND"):
                     i0, j0, i1, j1 = win
                     m[i0:i1, j0:j1] |= mask
         out[layer] = m
+    # a pad's track ends in open pour, not on a stitching via (that would read as a pad
+    # tied to a via, which a person does not draw)
+    awayFromVias = sp.maskDist(sp.viaAt, (0, 0, sp.H, sp.W), reach=0, pred=lambda a: a == nid) >= 0.8
+    for layer in out:
+        out[layer] &= awayFromVias
     return out
 
 
@@ -252,12 +264,22 @@ def repairUnreached(board, router, conns, log):
     a passive's or connector's pad gets a short track to the nearest stitched pour on its
     layer; a chip's exposed pad gets a via inside it; a chip's pin gets a fanout that
     prefers the inside of the pin ring. A via beside the pad, at least stitchPadGapMm
-    from every pad, is the last resort. Returns the connections left for push and shove
-    (fanouts)."""
+    from every pad, is the last resort. A custom-shaped pad (KiCad's thermal spokes
+    degenerate on its anchor) gets a solid connection to the pour instead of a track.
+    Returns (the connections left for push and shove, pads switched to solid)."""
     targets = pourTargets(board, router)
     done = Counter()
     fanout = []
+    solid = 0
     for c in conns:
+        fp = board.FindFootprintByReference(c.a.ref)
+        pad = fp.FindPadByNumber(c.a.num) if fp is not None else None
+        if pad is not None and pad.GetShape() == pcbnew.PAD_SHAPE_CUSTOM and \
+                pad.GetLocalZoneConnection() != pcbnew.ZONE_CONNECTION_FULL:
+            pad.SetLocalZoneConnection(pcbnew.ZONE_CONNECTION_FULL)
+            done["solid connection (custom-shaped pad)"] += 1
+            solid += 1
+            continue
         if router.isExposedPad(c.a):
             if router.viaInPad(c):
                 done["via in the exposed pad"] += 1
@@ -273,7 +295,80 @@ def repairUnreached(board, router, conns, log):
         c.deferred = False
         fanout.append(c)
     log("pads the pour does not reach: " + (", ".join(f"{n} {how}" for how, n in done.items()) or "none"))
-    return fanout
+    return fanout, solid
+
+
+SIDECAR = ".humanrouter.json"   # next to a board: the copper the router drew on it
+
+
+def itemKey(t):
+    """Where a board track or via is: a later run trusts its record only while this holds."""
+    if t.GetClass() == "PCB_VIA":
+        p = t.GetPosition()
+        return ["via", t.GetNetname(), p.x, p.y, t.GetWidth(pcbnew.F_Cu)]
+    a, b = t.GetStart(), t.GetEnd()
+    return ["track", t.GetNetname(), t.GetLayerName(), a.x, a.y, b.x, b.y, t.GetWidth()]
+
+
+def readRouterCopper(board, path):
+    """uuids of the board's tracks and vias an earlier run drew and nobody has moved since."""
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        rec = json.load(f)
+    return {t.m_Uuid.AsString() for t in board.GetTracks()
+            if rec.get(t.m_Uuid.AsString()) == itemKey(t)}
+
+
+def writeRouterCopper(board, path, designer):
+    """Record the copper on the board that is not the designer's (designer: uuids)."""
+    rec = {t.m_Uuid.AsString(): itemKey(t) for t in board.GetTracks()
+           if t.m_Uuid.AsString() not in designer}
+    with open(path, "w") as f:
+        json.dump(rec, f)
+    return len(rec)
+
+
+def offPlaneFanouts(drc, router):
+    """Plane fanouts that carry copper DRC reports unconnected: from each unconnected
+    track, via or pad of a partial plane's net, up through the routes it hangs off to the
+    fanout whose via should reach the plane but does not (it sits outside what the
+    plane's fill really reaches). Their connections."""
+    out = []
+    for u in drc["unconnected_items"]:
+        for it in u["items"]:
+            m = re.search(r"\[([^\]]+)\]", it["description"])
+            net = m.group(1) if m else None
+            if net not in router.planeCells:
+                continue
+            p = Point(it["pos"]["x"], it["pos"]["y"])
+            todo = [r for r in router.routes.values() if r.conn.net == net
+                    and any(router.sp.items[i].geom.distance(p) < 0.05 for i in r.items)]
+            seen = set()
+            while todo:
+                r = todo.pop()
+                if r.rid in seen:
+                    continue
+                seen.add(r.rid)
+                if r.conn.kind == "gnd" and r.conn.b is None and r.conn not in out:
+                    out.append(r.conn)
+                todo += [router.routes[q] for q in r.parents if q in router.routes]
+    return out
+
+
+def realPlaneFills(board, router):
+    """{net: inner fill} of the partial planes, as the board is filled now."""
+    fills = {}
+    for z in board.Zones():
+        if z.GetIsRuleArea() or z.GetNetname() not in router.planeCells:
+            continue
+        for kl in (pcbnew.In1_Cu, pcbnew.In2_Cu):
+            if z.IsOnLayer(kl):
+                g = polySetToShapely(z.GetFilledPolysList(kl))
+                if g is not None:
+                    n = z.GetNetname()
+                    fills[n] = g if n not in fills else fills[n].union(g)
+    return fills
 
 
 def strandedGnd(drc, conns):
@@ -342,7 +437,7 @@ def stitchPours(board, router, conns, net="GND"):
         if pt is None:
             return None
         # the routes are already written: this one goes onto the board now
-        writeItem(board, netInfo, router.viaItem(net, pt, rule, 0))
+        writeItem(board, netInfo, router.viaItem(net, pt, rule, 0), free=True)
         anchors.append(pt)
         i, j = sp.toCell(*pt)
         r = int(0.9 / sp.g)
@@ -358,14 +453,24 @@ def stitchPours(board, router, conns, net="GND"):
         if mask.size:
             i0, j0, i1, j1 = win
             inPour[i0:i1, j0:j1] |= mask
+    relaxed = None   # the fanout gap instead of the stitching gap, for a piece short of vias
     for layer, piece in pieces:
         near = piece.buffer(rv + 0.05)
         have = [a for a in anchors if near.contains(Point(a))]
         room = piece.buffer(-(rv + 0.1))
-        if len(have) < k.stitchPerIsland and not room.is_empty:
+        for gapPass in (0, 1):
+            if len(have) >= k.stitchPerIsland or room.is_empty:
+                break
+            if gapPass == 1:
+                if relaxed is None:
+                    # judged afresh: the vias placed so far are on the board already
+                    relaxed = router.stitchMask(net, padGap=k.fanoutViaGapMm)
+                mask_ok = relaxed
+            else:
+                mask_ok = ok
             win, mask = sp.rasterMask(room)
             i0, j0, i1, j1 = win
-            ii, jj = np.nonzero(mask & ok[i0:i1, j0:j1])
+            ii, jj = np.nonzero(mask & mask_ok[i0:i1, j0:j1])
             cands = [sp.toMm(i + i0, j + j0) for i, j in zip(ii, jj)]
             for _ in range(k.stitchPerIsland - len(have)):
                 if not cands:
@@ -378,6 +483,10 @@ def stitchPours(board, router, conns, net="GND"):
                     break
                 have.append(pt)
                 cands = [c for c in cands if math.dist(c, pt) > rule.viaDrill + 0.6]
+                if relaxed is not None:
+                    i, j = sp.toCell(*pt)
+                    r = int(0.9 / sp.g)
+                    relaxed[max(i - r, 0):i + r + 1, max(j - r, 0):j + r + 1] = False
         if not have:
             bare += piece.area >= 1.0   # slivers between pads do not count
             starved += [c for c in fanouts if c not in starved and layer in c.a.layers
@@ -520,11 +629,22 @@ def main():
     ap.add_argument("--drop-stale", action="store_true",
                     help="with --keep-copper: remove the board's copper that touches none of its "
                          "net's pads (left where a part used to be); without it, it is only listed")
+    ap.add_argument("--tidy", choices=("on", "off", "report", "only"), default="on",
+                    help="clean the copper up at the end, like KiCad's Cleanup Tracks & Vias (on, "
+                         "the default); report: list what it would change and change nothing; "
+                         "only: route nothing, just clean up the board's copper")
     ap.add_argument("--stitch-only", action="store_true",
                     help="route nothing: keep the board's copper, add return vias beside its signal "
                          "vias and stitch its outer ground pours to the plane")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="run number: the same board, options and seed give the same result; another "
+                         "seed tries the connections in a slightly different order (default 0)")
     args = ap.parse_args()
-    if args.stitch_only:
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        # Python orders sets of names differently in every process unless told otherwise:
+        # start again with that order fixed, so a run can be repeated exactly
+        os.execve(sys.executable, [sys.executable] + sys.argv, {**os.environ, "PYTHONHASHSEED": "0"})
+    if args.stitch_only or args.tidy == "only":
         args.keep_copper = True
     t0 = time.perf_counter()
     deadline = t0 + args.minutes * 60
@@ -566,16 +686,33 @@ def main():
         cur = getattr(knobs, key)
         setattr(knobs, key, (value.lower() in ("1", "true", "yes")) if isinstance(cur, bool) else type(cur)(value))
         log(f"knob {key} = {getattr(knobs, key)}")
+    knobs.seed = args.seed or knobs.seed
     router = Router(model, knobs, log)
     log(f"space: {router.sp.W}x{router.sp.H} cells @ {router.k.grid} mm")
-    keepZones, keepTracks = boardZones, set()
+    keepZones, keepTracks, designer = boardZones, set(), set()
     if args.keep_copper:
         # the output is the board as it is plus the new copper; its own copper is fixed
         board = pcbnew.LoadBoard(src)
         tracks, vias, keepTracks = existingCopper(board)
+        soft = readRouterCopper(board, os.path.join(srcDir, name + SIDECAR))
+        designer = keepTracks - soft
         keepZones = [z for z in board.Zones() if not z.GetIsRuleArea()]
+        if boardZones:
+            # the planes as the board's own copper leaves them: its vias cut the fill
+            fills = innerPlaneFills(board, boardPlanes(board), model.outline, keepIslands=True)
+            router.setPlaneFills(fills)
+            for net, fill in fills.items():
+                pieces = sorted((g for g in getattr(fill, "geoms", [fill]) if g.area >= 1.0),
+                                key=lambda g: -g.area) if fill is not None else []
+                if len(pieces) > 1:
+                    where = "; ".join(f"{g.area:.0f} mm2 at x {g.bounds[0]:.1f}-{g.bounds[2]:.1f}, "
+                                      f"y {g.bounds[1]:.1f}-{g.bounds[3]:.1f}" for g in pieces)
+                    log(f"WARNING: the {net} plane is in {len(pieces)} pieces ({where}): the "
+                        f"board's own copper cuts it. The router treats it as one plane, so pads "
+                        f"it ties to different pieces stay apart; join the pieces on the board")
         log(f"existing copper kept: {len(tracks)} tracks, {len(vias)} vias, {len(keepZones)} zones "
-            f"({router.loadExisting(tracks, vias)} fixed items)")
+            f"({router.loadExisting(tracks, vias, soft)} items; {len(soft)} drawn by an earlier run, "
+            f"which may be moved)")
         stale = staleCopper(board, router)
         if stale:
             where = []
@@ -590,12 +727,25 @@ def main():
                     keepTracks -= router.dropExisting(rid)
             log(f"copper touching no pad of its net ({'removed' if args.drop_stale else 'kept; --drop-stale removes it'}): "
                 + "; ".join(where))
+    if args.tidy == "only":
+        # route nothing, pour nothing: clean the board's own copper up and check it
+        if args.drop_stale:
+            ripCopper(board, keep=keepZones, keepTracks=keepTracks)
+        judge = Judge(os.path.join(args.out, "tidy"), name, os.path.join(srcDir, name + ".kicad_pro"),
+                      os.path.join(srcDir, name + ".kicad_dru"))
+        tidy(board, judge, log)
+        board.Save(outBoard)
+        drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
+        viol = Counter(v["type"] for v in drc["violations"])
+        log(f"DRC: {sum(viol.values())} violations {dict(viol)}, {len(drc['unconnected_items'])} unconnected")
+        return
     flows = []
     if args.flows:
         with open(args.flows) as f:
             flows = json.load(f)["flows"]
     router.flowNets = {f["net"] for f in flows}
     conns, block, bundles = plan(model, router, log, flows)
+    router.allConns = conns
     total = len(conns)
     if args.route == "blocks":
         conns = [c for c in conns if c.kind == "gnd" or not c.bundle]
@@ -650,12 +800,16 @@ def main():
             else:
                 viaBy[c.kind] += n
         log(f"vias by kind: {dict(viaBy)}")
-        powerNets = {n for n in model.netClass if router.powerClass(n)} | router.flowNets
+        # a net the designer put in the Rail class is a light rail (a backlight cathode, a
+        # reference): it keeps its class width unless a flow says it carries current
+        powerNets = {n for n in model.netClass if router.powerClass(n) and model.netClass[n] != "Rail"} \
+            | router.flowNets
         log(f"power copper: {router.fatten(powerNets)} tracks widened")
         audit(router, log, "power copper")
     if "GND" in router.planeNets and router.k.stitch:
         log(f"return vias: {router.returnVias()} GND vias beside signal vias")
-    finish = lambda: finishBoard(board, router, model, keepZones, conns, keepTracks, not boardZones, log)
+    finish = lambda: finishBoard(board, router, model, keepZones, conns, keepTracks - router.droppedUuids,
+                                 not boardZones, log)
     nT, nV, nIsl, islandPads = finish()
     board.Save(outBoard)
     log(f"wrote {outBoard}: {nT} tracks, {nV} vias")
@@ -665,21 +819,34 @@ def main():
         # all, pushing other routes aside, and write the board again
         found = strandedGnd(drc, conns)
         stranded = found + [c for c in islandPads if not c.routed and c not in found]
+        offPlane = offPlaneFanouts(drc, router)
+        if offPlane:
+            # route them again where the plane's fill really is
+            router.setPlaneFills({**{n: None for n in router.planeNets if n not in router.planeCells},
+                                  **realPlaneFills(board, router)})
+            ripped = []
+            for c in offPlane:
+                if c.rid in router.routes:
+                    router.rip(c.rid, ripped)   # and what hangs off it
+            log(f"plane fanouts outside the plane's fill: {len(offPlane)} routed again "
+                f"({len(ripped)} connections with them)")
+            stranded += [c for c in offPlane + ripped if c not in stranded]
         if router.k.fanoutParts == "none":
             # those pads take the pour by design; one it misses is joined to the pour,
             # not given a via beside it unless nothing else works
             missed = [c for c in stranded if c.deferred]
-            stranded = [c for c in stranded if not c.deferred] + repairUnreached(board, router, missed, log)
+            fan, solid = repairUnreached(board, router, missed, log)
+            stranded = [c for c in stranded if not c.deferred] + fan
             repaired = [c for c in missed if router.connected(c)]
         else:
-            repaired = []
-        if not stranded and not repaired:
+            repaired, solid = [], 0
+        if not stranded and not repaired and not solid:
             break
         if stranded:
             negotiate(router, list(stranded), log, maxRounds=10, winPads=(2.0, 6.0, 15.0))
             log(f"stranded GND pads: {sum(1 for c in stranded if router.connected(c))}/{len(stranded)} "
                 f"fanned out to the plane")
-        fixed = sum(1 for c in stranded + repaired if router.connected(c))
+        fixed = sum(1 for c in stranded + repaired if router.connected(c)) + solid
         if not fixed:
             break
         nT, nV, nIsl, islandPads = finish()
@@ -689,7 +856,7 @@ def main():
         solid = fixStarvedThermals(board, drc)
         if not solid:
             break
-        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+        fillZones(board)
         board.Save(outBoard)
         log(f"thermals: {solid} GND pads switched to solid pour connection")
         drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
@@ -697,8 +864,19 @@ def main():
                      for m in [re.search(r"[Pp]ad (\S+) \[GND\] of (\S+)", it["description"])] if m})
     if missed:
         log(f"GND pads the pour does not reach: {', '.join(missed)}")
+    if args.tidy != "off":
+        judge = Judge(os.path.join(args.out, "tidy"), name, os.path.join(srcDir, name + ".kicad_pro"),
+                      os.path.join(srcDir, name + ".kicad_dru"))
+        tidy(board, judge, log, report=args.tidy == "report")
+        if args.tidy != "report":
+            board.Save(outBoard)
+            drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
     viol = Counter(v["type"] for v in drc["violations"])
     log(f"DRC: {sum(viol.values())} violations {dict(viol)}, {len(drc['unconnected_items'])} unconnected")
+    if router.droppedUuids:
+        log(f"moved: {len(router.droppedUuids)} tracks and vias an earlier run drew were ripped to make room")
+    log(f"router copper recorded: {writeRouterCopper(board, os.path.join(args.out, name + SIDECAR), designer)} "
+        f"items in {name + SIDECAR}")
     summary = dict(minutes=(time.perf_counter() - t0) / 60, tracks=nT, vias=nV,
                    violations=dict(viol), unconnected=len(drc["unconnected_items"]),
                    unroutedConns=len(unrouted), leftToYou=total - len(conns))

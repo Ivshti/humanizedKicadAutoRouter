@@ -80,15 +80,16 @@ class Model:
     planes: dict = field(default_factory=dict)  # plane net -> inner copper (shapely), None = whole board
 
 
-def polySetToShapely(sps):
+def polySetToShapely(sps, scale=NM):
+    """A KiCad SHAPE_POLY_SET as shapely geometry, in mm (scale=1: in KiCad's nm)."""
     polys = []
     for i in range(sps.OutlineCount()):
         o = sps.Outline(i)
-        pts = [(o.CPoint(j).x / NM, o.CPoint(j).y / NM) for j in range(o.PointCount())]
+        pts = [(o.CPoint(j).x / scale, o.CPoint(j).y / scale) for j in range(o.PointCount())]
         holes = []
         for h in range(sps.HoleCount(i)):
             hc = sps.Hole(i, h)
-            holes.append([(hc.CPoint(j).x / NM, hc.CPoint(j).y / NM) for j in range(hc.PointCount())])
+            holes.append([(hc.CPoint(j).x / scale, hc.CPoint(j).y / scale) for j in range(hc.PointCount())])
         if len(pts) >= 3:
             polys.append(Polygon(pts, holes))
     return unary_union(polys) if polys else None
@@ -153,8 +154,10 @@ def loadModel(board, proPath):
                 d = pad.GetDrillSize()
                 drill = max(d.x, d.y) / NM
                 holes.append((center[0], center[1], drill / 2, str(pad.GetNetname())))
+            # an edge-connector pad (gold finger) is a surface pad too: no hole reaches a plane
+            surface = attr in (pcbnew.PAD_ATTRIB_SMD, pcbnew.PAD_ATTRIB_CONN)
             pm = Pad(fp.GetReference(), str(pad.GetNumber()), str(pad.GetNetname()), layers, poly,
-                     center, attr == pcbnew.PAD_ATTRIB_SMD, drill, side, len(pads))
+                     center, surface, drill, side, len(pads))
             for l in layers[1:]:
                 pl = polySetToShapely(pad.GetEffectivePolygon(KICAD_LAYERS[l], pcbnew.ERROR_OUTSIDE))
                 if pl is not None and not pl.equals(poly):
@@ -242,10 +245,27 @@ def boardPlanes(board):
             and z.GetNetname() and any(z.IsOnLayer(l) for l in INNER_KICAD)]
 
 
-def innerPlaneFills(board, zones, outline):
-    """{net: inner copper of that net's planes} filled on the ripped board (pads and holes
-    only); a plane that covers the board is None."""
-    pcbnew.ZONE_FILLER(board).Fill(board.Zones())  # on the ripped board: these and rule areas
+def fillZones(board):
+    """Fill every zone the way KiCad itself does: with the board's connectivity rebuilt
+    first. Island removal decides from connectivity, so after tracks were added from
+    Python a fill without the rebuild keeps or drops pieces differently from KiCad's own
+    refill."""
+    board.BuildConnectivity()
+    pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+
+
+def innerPlaneFills(board, zones, outline, keepIslands=False):
+    """{net: inner copper of that net's planes} as the board fills them (on the ripped
+    board: around pads and holes only); a plane that covers the board is None.
+    keepIslands: count the pieces nothing of the net touches yet (new fanouts may reach
+    them) instead of letting the fill drop them."""
+    modes = [(z, z.GetIslandRemovalMode()) for z in zones]
+    if keepIslands:
+        for z, _ in modes:
+            z.SetIslandRemovalMode(pcbnew.ISLAND_REMOVAL_MODE_NEVER)
+    fillZones(board)
+    for z, m in modes:
+        z.SetIslandRemovalMode(m)
     fills = {}
     for z in zones:
         for l in INNER_KICAD:
