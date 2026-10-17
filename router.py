@@ -669,11 +669,15 @@ class Router:
                 if inner.is_empty:
                     inner = Point(item.pad.center).buffer(sp.g * 0.8)
                 cache[key] = sp.rasterMask(inner)
-            else:  # land on a pad: anywhere on its copper, a little in from the edge, so an
-                # end on the pad's rim is inside KiCad's outline too (ours is rounded outward)
+            elif not item.geom.contains(Point(item.pad.center)):
+                # a pad with no copper at its centre (a ring around a microphone's sound
+                # port): no entry leg pulls the end to the centre, so it must land a little
+                # in from the edge, inside KiCad's outline too (ours is rounded outward)
                 land = item.geom.buffer(-0.03)
                 win, mask = sp.rasterMask(land) if not land.is_empty else (None, np.zeros(0, bool))
                 cache[key] = (win, mask) if mask.size and mask.any() else self.cachedMask(item, "copper")
+            else:  # land on a pad: anywhere on its copper (the entry leg goes on to the centre)
+                cache[key] = self.cachedMask(item, "copper")
         return cache[key]
 
     @staticmethod
