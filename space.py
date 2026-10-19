@@ -48,6 +48,9 @@ class Space:
         self.H = int(math.ceil((maxy - miny + 1.0) / grid)) + 1
         self.occ = np.zeros((NLAYERS, self.H, self.W), np.int16)
         self.fixed = np.zeros((NLAYERS, self.H, self.W), np.int16)  # pads, holes, edge only
+        # copper of a net class whose clearance is below the default (fine-pitch classes):
+        # a search of such a class keeps only its own clearance from this copper
+        self.fine = np.zeros((NLAYERS, self.H, self.W), bool)
         self.trackKeep = np.zeros((NLAYERS, self.H, self.W), bool)
         self.viaKeep = np.zeros((self.H, self.W), bool)
         self.smdPad = np.zeros((self.H, self.W), np.int16)   # SMD pad owner on F or B
@@ -130,6 +133,7 @@ class Space:
             i0, j0, i1, j1 = win
             sub = self.occ[l, i0:i1, j0:j1]
             sub[mask & (sub == item.net)] = 0
+            self.fine[l, i0:i1, j0:j1][mask & (sub == 0)] = False
         if item.kind == "via":
             i, j = self.toCell(*item.pts[0])
             if self.viaAt[i, j] == item.net:
@@ -169,6 +173,8 @@ class Space:
                     sub[mask] = HARD
                 else:
                     sub[mask & (sub == 0)] = item.net
+            if item.clearance < self.defaultClearance - 1e-9 and item.kind != "hole":
+                self.fine[l, i0:i1, j0:j1][mask] = True
             if record:
                 item.stamped.append((l, win, mask))
 
@@ -199,19 +205,26 @@ class Space:
         return out
 
     # ---- distance fields ---------------------------------------------------------
-    def foreignDist(self, net, layer, win, reach=0.9, fixedOnly=False, nets=None):
+    def foreignDist(self, net, layer, win, reach=0.9, fixedOnly=False, nets=None, only=None):
         """Distance (mm) from each cell centre in win to the nearest copper of another net
-        (`nets`: several nets count as own, e.g. both of a differential pair)."""
-        own = tuple(nets) if nets else (net,)
+        (`nets`: several nets count as own, e.g. both of a differential pair). only: "fine"
+        counts just the copper of classes below the default clearance, "coarse" the rest."""
+        # copper of no net (HARD) is nobody's: not even a pair's centreline, which searches
+        # as net -1 to have both its nets' copper count as foreign
+        own = tuple(n for n in (nets if nets else (net,)) if n != HARD)
         i0, j0, i1, j1 = win
         r = int(math.ceil(reach / self.g))
         I0, J0 = max(i0 - r, 0), max(j0 - r, 0)
         I1, J1 = min(i1 + r, self.H), min(j1 + r, self.W)
         src = self.fixed if fixedOnly else self.occ
         sub = src[layer, I0:I1, J0:J1] if layer is not None else src[:, I0:I1, J0:J1]
+        if only is not None:
+            fine = self.fine[layer, I0:I1, J0:J1] if layer is not None else self.fine[:, I0:I1, J0:J1]
+            sub = np.where(fine if only == "coarse" else ~fine, 0, sub)
         if layer is None:  # any layer (through vias)
-            sub = np.where(((sub != 0) & ~np.isin(sub, own)).any(axis=0), HARD, 0)
-        free = (sub == 0) | np.isin(sub, own)
+            free = ~((sub != 0) & ~np.isin(sub, own)).any(axis=0)
+        else:
+            free = (sub == 0) | np.isin(sub, own)
         if free.all():
             return np.full((i1 - i0, j1 - j0), 1e3, np.float32)
         d = edt(~free) * self.g
@@ -232,10 +245,14 @@ class Space:
 
     # ---- exact checks ------------------------------------------------------------
     def violations(self, net, layers, geom, clearance, isVia=False, drill=0.0, holeToHole=0.25,
-                   holeClearance=0.2, ignore=()):
-        """Exact clearance check of a would-be item against everything stored."""
-        minx, miny, maxx, maxy = geom.bounds
+                   holeClearance=0.2, ignore=(), local=()):
+        """Exact clearance check of a would-be item against everything stored. local:
+        [(area, clearance)] the design rules set where either item touches the area (a
+        BGA's courtyard), in place of the net classes'."""
         reach = 0.6
+        near = [(a, c) for a, c in local if a.distance(geom) <= reach] if local else ()
+        mine = [c for a, c in near if a.intersects(geom)]
+        minx, miny, maxx, maxy = geom.bounds
         bad = []
         for other in self.query(layers, (minx - reach, miny - reach, maxx + reach, maxy + reach)):
             if other.iid in ignore:
@@ -272,6 +289,10 @@ class Space:
             if other.net == net and net != HARD:
                 continue
             need = max(clearance, other.clearance)
+            if near:
+                cs = mine or [c for a, c in near if a.intersects(other.geom)]
+                if cs:
+                    need = min(cs)
             if other.kind == "edge":
                 need = self.edgeClearance
             if geom.distance(other.geom) < need - 1e-4:

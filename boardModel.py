@@ -294,3 +294,22 @@ def readSkewRules(druPath):
         for pat in re.findall(r"inDiffPair\('([^']+)'\)", rule):
             out.append((pat, mm))
     return out
+
+
+def readCourtyardClearances(druPath):
+    """Clearances a .kicad_dru sets inside a part's courtyard: {ref: mm} from rules with an
+    `insideCourtyard('REF')` condition and a `(constraint clearance (min X))` (a BGA's
+    fanout rule: one track between two balls)."""
+    if not os.path.exists(druPath):
+        return {}
+    with open(druPath) as f:
+        text = f.read()
+    out = {}
+    for rule in re.split(r"\(rule\s", text)[1:]:
+        m = re.search(r"\(constraint\s+clearance\s+\(min\s+([\d.]+)\s*(mm|mil)?\)", rule)
+        if not m:
+            continue
+        mm = float(m.group(1)) * (0.0254 if m.group(2) == "mil" else 1.0)
+        for ref in re.findall(r"insideCourtyard\('([^']+)'\)", rule):
+            out[ref] = mm
+    return out

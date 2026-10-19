@@ -23,7 +23,7 @@ import pcbnew
 from shapely.geometry import Point
 
 from boardModel import (B, F, IN1, IN2, boardPlanes, existingCopper, fillZones, innerPlaneFills,
-                        loadModel, polySetToShapely, readSkewRules, ripCopper)
+                        loadModel, polySetToShapely, readCourtyardClearances, readSkewRules, ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from router import Knobs, Router
@@ -121,6 +121,7 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     # the Nano's power needed: negotiation 59 -> ~150 rounds)
     first = [c for c in order if not (c.bundle and c.kind == "sig")]
     later = [c for c in order if c.bundle and c.kind == "sig"]
+    router.reserveEscapes(order, log)
     relaxed = 0
     for c in first:
         st, _ = router.route(c, layersFor(c), winPadsFor(c), viaMm=viaMmFor(c, k))
@@ -688,6 +689,11 @@ def main():
         log(f"knob {key} = {getattr(knobs, key)}")
     knobs.seed = args.seed or knobs.seed
     router = Router(model, knobs, log)
+    courtyards = readCourtyardClearances(os.path.join(srcDir, name + ".kicad_dru"))
+    if courtyards:
+        router.setCourtyardClearances(courtyards)
+        log("clearance inside courtyards (design rules): "
+            + ", ".join(f"{ref} {mm:g} mm" for ref, mm in sorted(courtyards.items())))
     log(f"space: {router.sp.W}x{router.sp.H} cells @ {router.k.grid} mm")
     keepZones, keepTracks, designer = boardZones, set(), set()
     if args.keep_copper:

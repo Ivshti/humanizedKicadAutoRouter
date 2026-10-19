@@ -7,7 +7,9 @@ part U2, south-east of it, has them side by side (DP west of DN). Leaving U1 eas
 the short way into U2 comes down from the north, which puts the nets on the wrong
 sides: the tracks would have to cross. The ways that keep the polarity are longer (come
 up into U2 from the south, or leave U1 westwards). The router must lay the pair together that way (one
-centreline, no crossing) instead of giving up and routing the two nets apart.
+centreline, no crossing) instead of giving up and routing the two nets apart: on near-square
+pads by retrying from the side that keeps the polarity, on pins by leaving each pin
+straight out first.
 """
 import json
 import math
@@ -39,7 +41,7 @@ PRO = {
 }
 
 
-def board(path):
+def board(path, pin):
     b = pcbnew.BOARD()
     nets = {}
     for n in ("USB_DP", "USB_DN"):
@@ -70,19 +72,21 @@ def board(path):
             p.SetNet(nets[net])
             fp.Add(p)
     # U1: DP above DN, pins pointing east
-    part("U1", [("1", "USB_DP", (6.0, 8.0), (0.8, 0.3)), ("2", "USB_DN", (6.0, 8.5), (0.8, 0.3))])
+    part("U1", [("1", "USB_DP", (6.0, 8.0), (pin, 0.3)), ("2", "USB_DN", (6.0, 8.5), (pin, 0.3))])
     # U2: DP west of DN, pins pointing north... and south (both ways are open)
-    part("U2", [("1", "USB_DP", (20.0, 18.0), (0.3, 0.8)), ("2", "USB_DN", (20.5, 18.0), (0.3, 0.8))])
+    part("U2", [("1", "USB_DP", (20.0, 18.0), (0.3, pin)), ("2", "USB_DN", (20.5, 18.0), (0.3, pin))])
     b.Save(path)
     with open(path.replace(".kicad_pcb", ".kicad_pro"), "w") as f:
         json.dump(PRO, f)
     return pcbnew.LoadBoard(path)
 
 
-def main():
+def attempt(pin, how):
+    """Route the pair on pads `pin` mm long; `how`: the log line that must show how it
+    was laid. Returns the failures."""
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "pair.kicad_pcb")
-    b = board(path)
+    b = board(path, pin)
     model = loadModel(b, path.replace(".kicad_pcb", ".kicad_pro"))
     model.planes = {}
     logs = []
@@ -96,8 +100,8 @@ def main():
     if not ok:
         failures.append("the pair was not laid together")
     else:
-        if not any("keeps the polarity" in m for m in logs):
-            failures.append("laid, but not by the side retry (the cheapest centreline should not lay)")
+        if not any(how[0] in m for m in logs):
+            failures.append(how[1])
         a = [router.sp.items[i] for i in router.routes[lead.rid].items if router.sp.items[i].kind == "track"]
         d = [router.sp.items[i] for i in router.routes[follow.rid].items if router.sp.items[i].kind == "track"]
         # the nets do not touch, and the pair stays coupled: every DP piece has a DN piece
@@ -112,10 +116,21 @@ def main():
         if coupled < 0.6 * total:
             failures.append(f"only {coupled:.1f} of {total:.1f} mm of DP runs beside DN")
     if failures:
+        failures.append("router log:\n    " + "\n    ".join(m for m in logs if m.startswith("pair")))
+    return failures
+
+
+def main():
+    failures = []
+    # near-square pads: nothing to escape along, the side retry has to find the way
+    failures += attempt(0.4, ("keeps the polarity", "square pads: laid, but not by the side retry "
+                                                    "(the cheapest centreline should not lay)"))
+    # pins: each net runs straight out of its pin first, and the pair lays from there
+    failures += attempt(0.8, ("escaped the pins", "pins: laid, but not out of the pins"))
+    if failures:
         print("FAIL\n  " + "\n  ".join(failures))
-        print("router log:\n  " + "\n  ".join(m for m in logs if m.startswith("pair")))
         sys.exit(1)
-    print("PASS: pair laid together from the side that keeps the polarity")
+    print("PASS: pair laid together, keeping the polarity, from square pads and out of pins")
 
 
 if __name__ == "__main__":

@@ -152,7 +152,10 @@ check the following.
 2. **The `.kicad_pro` sits next to the board.** Net classes, their track
    widths, clearances and via sizes, and the net-class patterns all come from
    it. A `.kicad_dru` with custom rules is copied along and is honoured by the
-   final DRC.
+   final DRC. The router itself also reads two kinds of rule from it: a pair's
+   skew budget (see below), and the clearance a rule sets inside a part's
+   courtyard (`insideCourtyard('U1')`, the usual way to let one track pass
+   between two balls of a fine-pitch BGA).
 3. **A 4-layer stack-up.** Layers are outer top, two inner, outer bottom.
    Signals and power are routed on the outer layers only.
 4. **Planes.** Copper zones you have drawn on the inner layers are kept exactly
@@ -197,7 +200,24 @@ check the following.
     matched to 1.5 mm (`--knob pairSkewMm=…`) when each of its nets runs from
     one pin to one pin. A pair that also reaches a test point or a second part
     is not matched without a rule: the branch makes a net longer but not the
-    pair.
+    pair. Meanders never go under a BGA.
+
+    A pair leaves its pins the way a person fans it out before running as a
+    pair:
+    - **Out of a BGA**, when its two balls sit side by side across the outer
+      two rings: the outer ball's track runs straight out; the inner ball's
+      track takes one diagonal step into the gap beside the outer ball, always
+      on the same side (a quarter turn from the way out), then runs straight
+      out beside it. Both stay on the balls' layer, with no via, to just past
+      the courtyard, so neighbouring pairs come out N, P, N, P at half the ball
+      pitch. If that gap is blocked, the pair is not escaped and the run log
+      names what is in the way; the other side would swap the pair's two nets
+      over and take its neighbour's gap.
+    - **Out of a row of pins** (a connector, a fine-pitch chip): both tracks run
+      straight out of their pins, away from the part's body, before closing up.
+    From there the pair runs straight on for a short stretch with no via, then
+    goes its way as a pair. The escapes are part of the pair's own routing, so
+    they count towards its length when it is matched.
 
 Any existing tracks, vias and outer-layer copper pours are removed before
 routing. The router always starts from a clean board, plus your inner planes.

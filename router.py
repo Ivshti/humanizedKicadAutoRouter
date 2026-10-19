@@ -6,6 +6,7 @@ real geometry (tracks + vias), is pulled tight, and is verified exactly before i
 committed. Negotiation mode lets a search cross other routes at a price and rips the
 routes it crossed; they go back on the queue.
 """
+import copy
 import ctypes
 import math
 import os
@@ -14,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 import native
@@ -151,6 +152,7 @@ class Conn:
     pairLeader: object = None # set on a pair's second net: the first net's connection
     pairMate: object = None   # both nets of a pair: the other one's connection
     pairTried: bool = False   # the pair was already tried together (see Router.routePair)
+    escapes: object = None    # a pair's reserved escapes (see reserveEscapes)
     deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
     layerLock: int = -1       # the only layer this connection may use (-1: any)
     viaGapMm: float = -1.0    # a fanout's via-to-pad gap when not fanoutViaGapMm (-1)
@@ -165,6 +167,16 @@ class Route:
     nodes: list               # union-find nodes this route joins
     parents: set
     paired: bool = False      # laid together with its differential partner
+
+
+class EscapeEnd:
+    """Where a BGA escape leaves one net of a pair: the pair is routed from here as if it
+    were the ball (the escape's own tracks are its items)."""
+    def __init__(self, pad, point, layer, items):
+        self.ref, self.num, self.net = pad.ref, pad.num, pad.net
+        self.center, self.layers, self.items = point, [layer], items
+        self.poly = Point(point).buffer(0.01)
+        self.smd, self.side, self.pid = True, pad.side, -1
 
 
 class Router:
@@ -205,6 +217,13 @@ class Router:
         for pad in model.pads:
             self.padsOfRef.setdefault(pad.ref, []).append(pad)
         self.hulls = {}
+        self.grids = {}            # ref -> ball grid (pitch, bounds) or None, see gridArray
+        # the largest clearance among the classes below the default (see clearDist)
+        self.fineClearance = max((c.clearance for c in model.classes.values()
+                                  if c.clearance < self.sp.defaultClearance - 1e-9), default=0.0)
+        self.courtyardRules = []   # [(courtyard, clearance)] the design rules set inside parts
+        self.forcedEnds = (None, None)   # pair ends a BGA escape fixes (see routePair)
+        self.fronts = {}           # id(pair lead) -> [(win, mask, layer)]: room kept in front of its escapes
         self.ruleAreas = np.zeros((self.sp.H, self.sp.W), bool)   # cells within any rule area
         # nets the finished board pours on both outer layers (finishBoard): their pads
         # can be left to the pour
@@ -462,6 +481,20 @@ class Router:
         return out
 
     # ---- cost raster -------------------------------------------------------------------
+    def clearDist(self, nid, layer, win, clearance, fixedOnly=False, nets=None):
+        """Distance to other nets' copper, for tests of the form `distance >= half width +
+        clearance + margin`: copper is stamped for the default clearance, so a search with
+        less (a fine-pitch class) keeps the default from ordinary copper and only its own
+        from copper of the fine classes."""
+        sp = self.sp
+        d = sp.foreignDist(nid, layer, win, fixedOnly=fixedOnly, nets=nets,
+                           only="coarse" if clearance < sp.defaultClearance - 1e-9 else None)
+        if clearance >= sp.defaultClearance - 1e-9:
+            return d
+        fine = sp.foreignDist(nid, layer, win, fixedOnly=fixedOnly, nets=nets, only="fine")
+        return np.minimum(d - (sp.defaultClearance - clearance),
+                          fine - max(self.fineClearance - clearance, 0.0))
+
     def buildCost(self, conn, rule, win, layers, srcItems, dstItems, negotiate, extraMargin,
                   ownNets=None, ownPads=None):
         sp, k, g = self.sp, self.k, self.k.grid
@@ -496,18 +529,21 @@ class Router:
         cost = np.empty((len(layers), h, w), np.float32)
         wideOk = np.empty((len(layers), h, w), bool)
         for li, l in enumerate(layers):
-            dAll = sp.foreignDist(nid, l, win, nets=nets)
+            dAll = self.clearDist(nid, l, win, rule.clearance, nets=nets)
             wideOk[li] = dAll >= rW
             ok = wideOk[li] | (neckZone & (dAll >= rN))
             soft = None
             if negotiate:
                 # routes in the way will be ripped: judge width against fixed copper only
-                dFix = sp.foreignDist(nid, l, win, fixedOnly=True, nets=nets)
+                dFix = self.clearDist(nid, l, win, rule.clearance, fixedOnly=True, nets=nets)
                 okFix = (dFix >= rW) | (neckZone & (dFix >= rN))
                 soft = okFix & ~ok
                 ok = okFix
                 wideOk[li] = dFix >= rW
             ok &= ~sp.trackKeep[l, i0:i1, j0:j1]
+            for fl, cells in self.frontsIn(win):
+                if fl == l:
+                    ok &= ~cells
             if not plane:
                 ok &= ~(self.bodyKeep[l, i0:i1, j0:j1] & ~escape)
                 if k.thermalHard:
@@ -549,9 +585,11 @@ class Router:
                     view[sub & (view < 0)] = 1.0
         # vias
         rv = rule.viaDia / 2
-        dAny = sp.foreignDist(nid, None, win, fixedOnly=negotiate, nets=nets)
+        dAny = self.clearDist(nid, None, win, rule.clearance, fixedOnly=negotiate, nets=nets)
         viaok = dAny >= rv + rule.clearance + m
         viaok &= ~sp.viaKeep[i0:i1, j0:j1]
+        for _, cells in self.frontsIn(win):
+            viaok &= ~cells
         if not plane:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
         # one cell of raster slack: a pad corner can rasterise one cell short
@@ -872,7 +910,13 @@ class Router:
     def check(self, it, ignore=()):
         return self.sp.violations(it.net, it.layers, it.geom, it.clearance, isVia=it.kind == "via",
                                   drill=it.drill, holeToHole=self.m.minHoleToHole,
-                                  holeClearance=self.m.minHoleClearance, ignore=ignore)
+                                  holeClearance=self.m.minHoleClearance, ignore=ignore,
+                                  local=self.courtyardRules)
+
+    def setCourtyardClearances(self, rules):
+        """{ref: mm} from the design rules: the clearance inside those parts' courtyards."""
+        self.courtyardRules = [(self.m.footprints[ref].courtyard, mm) for ref, mm in rules.items()
+                               if ref in self.m.footprints and self.m.footprints[ref].courtyard is not None]
 
     @staticmethod
     def octilinear(p, q):
@@ -1629,6 +1673,8 @@ class Router:
 
     # ---- differential pairs laid together ------------------------------------------------
     def padItems(self, pad):
+        if isinstance(pad, EscapeEnd):
+            return pad.items
         nid = self.netId[pad.net]
         return [self.sp.items[i] for i in self.netItems.get(nid, ())
                 if self.sp.items[i].kind == "pad" and self.sp.items[i].pad is pad]
@@ -1665,6 +1711,175 @@ class Router:
         return out
 
     SLOT_MM = 0.8   # how far a slotted pair end runs straight out from its pads
+    ESCAPE_PAST_MM = 0.15   # how far past a ball grid's courtyard a pair's escape runs
+
+    def gridArray(self, ref):
+        """(pitch, (minx, miny, maxx, maxy)) when the pads of `ref` sit on a square grid of
+        at least 4 x 4 at 1 mm pitch or finer (a BGA); None for any other part."""
+        if ref not in self.grids:
+            out = None
+            pads = self.padsOfRef.get(ref, ())
+            xs = sorted({round(p.center[0], 4) for p in pads})
+            ys = sorted({round(p.center[1], 4) for p in pads})
+            if len(pads) >= 16 and len(xs) >= 4 and len(ys) >= 4:
+                steps = [b - a for a, b in zip(xs, xs[1:])] + [b - a for a, b in zip(ys, ys[1:])]
+                pitch = min(steps)
+                if 0 < pitch <= 1.0 and all(abs(d / pitch - round(d / pitch)) < 0.01 for d in steps):
+                    out = (pitch, (xs[0], ys[0], xs[-1], ys[-1]))
+            self.grids[ref] = out
+        return self.grids[ref]
+
+    def rowEscape(self, padL, padF, rule):
+        """How a pair leaves two neighbouring pins of a row (a connector, a fine-pitch
+        chip): both tracks straight out along the pins, past their ends, away from the
+        part's body (towards it if that is blocked), before they close up to the pair's
+        gap. Same result as pairEscape, or None."""
+        if padL.ref != padF.ref or not (padL.smd and padF.smd) or padL.layers != padF.layers \
+                or self.gridArray(padL.ref) is not None:
+            return None
+        axes = []
+        for p in (padL, padF):
+            minx, miny, maxx, maxy = p.poly.bounds
+            w, h = maxx - minx, maxy - miny
+            axes.append((1, 0) if w > 1.5 * h else (0, 1) if h > 1.5 * w else None)
+        d = self.unit(padL.center, padF.center)
+        if axes[0] is None or axes[0] != axes[1] or abs(d[0] * axes[0][0] + d[1] * axes[0][1]) > 0.1 \
+                or math.dist(padL.center, padF.center) > 1.0:
+            return None
+        ax = axes[0]
+        fp = self.m.footprints[padL.ref]
+        away = 1 if (padL.center[0] - fp.pos[0]) * ax[0] + (padL.center[1] - fp.pos[1]) * ax[1] >= 0 else -1
+        minx, miny, maxx, maxy = padL.poly.bounds
+        reach = max(maxx - minx, maxy - miny) / 2 + self.ESCAPE_PAST_MM
+        layer = padL.layers[0]
+        for sgn in (away, -away):
+            u = (ax[0] * sgn, ax[1] * sgn)
+            paths = {p.net: [p.center, (p.center[0] + u[0] * reach, p.center[1] + u[1] * reach)]
+                     for p in (padL, padF)}
+            items = {n: [self.trackItem(n, layer, a, b, rule.width, rule.clearance, 0) for a, b in zip(q, q[1:])]
+                     for n, q in paths.items()}
+            if any(self.check(it) for its in items.values() for it in its) \
+                    or not self.pairClear(items[padL.net], items[padF.net]):
+                continue
+            ends = [q[-1] for q in paths.values()]
+            return dict(paths=paths, items=items, u=u, layer=layer,
+                        mid=((ends[0][0] + ends[1][0]) / 2, (ends[0][1] + ends[1][1]) / 2))
+        return None
+
+    def findEscapes(self, lead, follow):
+        """The escapes of the ends of a pair that leave a BGA or a row of pins."""
+        rule = self.ruleForConn(lead)
+        out = []
+        for pl in (lead.a, lead.b):
+            pf = next((p for p in (follow.a, follow.b) if p is not None and pl is not None and p.ref == pl.ref), None)
+            if pf is None:
+                continue
+            e = self.pairEscape(pl, pf, rule) or self.rowEscape(pl, pf, rule)
+            if e is not None:
+                out.append(e)
+        return out
+
+    def reserveEscapes(self, conns, log):
+        """The escape stage, before any pair is routed: every pair's way out of its BGA or
+        row of pins goes down now, so a pair routed early cannot cut across the lane a
+        neighbouring pair will need. A pair that cannot be laid together hands its escape
+        back before its nets are routed one by one."""
+        n = 0
+        for c in conns:
+            if c.pairMate is None or c.pairLeader is not None or c.escapes is not None or c.routed \
+                    or self.connected(c) or self.connected(c.pairMate):
+                continue
+            esc = self.findEscapes(c, c.pairMate)
+            for it in (it for e in esc for its in e["items"].values() for it in its):
+                self.sp.add(it)
+                self.netItems.setdefault(it.net, set()).add(it.iid)
+            c.escapes = esc
+            n += len(esc)
+            # and the room just past them, where the pair has to start: no other net plans
+            # through it until the pair has been tried
+            rule = self.ruleForConn(c)
+            half = rule.width + self.m.classes[rule.cls].pairGap / 2 + rule.clearance
+            zones = []
+            for e in esc:
+                (mx, my), (ux, uy) = e["mid"], e["u"]
+                L = self.SLOT_MM + 0.4
+                poly = Polygon([(mx - uy * half, my + ux * half), (mx + uy * half, my - ux * half),
+                                (mx + uy * half + ux * L, my - ux * half + uy * L),
+                                (mx - uy * half + ux * L, my + ux * half + uy * L)])
+                win, mask = self.sp.rasterMask(poly)
+                if mask.size:
+                    zones.append((win, mask, e["layer"]))
+            if zones:
+                self.fronts[id(c)] = zones
+        if n:
+            log(f"escape stage: {n} pair ends fanned out of their pins before the pairs")
+
+    def frontsIn(self, win):
+        """(layer, cells) in `win` reserved in front of pairs' escapes (see reserveEscapes)."""
+        i0, j0, i1, j1 = win
+        for zones in self.fronts.values():
+            for (a0, b0, a1, b1), mask, layer in zones:
+                c0, d0, c1, d1 = max(a0, i0), max(b0, j0), min(a1, i1), min(b1, j1)
+                if c1 <= c0 or d1 <= d0:
+                    continue
+                cells = np.zeros((i1 - i0, j1 - j0), bool)
+                cells[c0 - i0:c1 - i0, d0 - j0:d1 - j0] = mask[c0 - a0:c1 - a0, d0 - b0:d1 - b0]
+                yield layer, cells
+
+    def gridCourtyards(self):
+        """The courtyards of the board's ball grids."""
+        return [fp.courtyard for ref, fp in self.m.footprints.items()
+                if fp.courtyard is not None and self.gridArray(ref) is not None]
+
+    def pairEscape(self, padL, padF, rule):
+        """How a pair leaves a ball grid when its two balls sit side by side across the
+        outer two rings: the outer ball's net runs straight out; the inner ball's net takes
+        one diagonal step into the gap beside the outer ball, on the side a quarter turn
+        from the way out (the same side for every pair, so the escaped tracks come out
+        N, P, N, P at half the pitch), then straight out beside it. Both stay on the balls'
+        layer, without vias, to just past the courtyard. Returns {"paths": {net: points},
+        "items": {net: items}, "mid", "u", "layer"} or None when the pair is not like that
+        or the escape does not fit."""
+        if padL.ref != padF.ref or not (padL.smd and padF.smd) or padL.layers != padF.layers:
+            return None
+        grid = self.gridArray(padL.ref)
+        if grid is None:
+            return None
+        pitch, (x0, y0, x1, y1) = grid
+        if abs(math.dist(padL.center, padF.center) - pitch) > 1e-3:
+            return None
+        for outer, inner in ((padL, padF), (padF, padL)):
+            u = self.unit(inner.center, outer.center)
+            u = (round(u[0]), round(u[1]))
+            ox, oy = outer.center
+            edge = {(0, -1): abs(oy - y0), (0, 1): abs(oy - y1), (1, 0): abs(ox - x1), (-1, 0): abs(ox - x0)}
+            if edge.get(u, 1.0) < 1e-3:
+                break
+        else:
+            return None
+        crt = self.m.footprints[padL.ref].courtyard
+        bx0, by0, bx1, by1 = crt.bounds if crt is not None else (x0 - pitch, y0 - pitch, x1 + pitch, y1 + pitch)
+        reach = {(0, -1): oy - by0, (0, 1): by1 - oy, (1, 0): bx1 - ox, (-1, 0): ox - bx0}[u] + self.ESCAPE_PAST_MM
+        layer, half, O, I = outer.layers[0], pitch / 2, outer.center, inner.center
+        # the quarter turn, the same for every pair: the other side would swap this pair's
+        # two nets over and take the gap its neighbour needs
+        s = (-u[1], u[0])
+        G = (I[0] + (u[0] + s[0]) * half, I[1] + (u[1] + s[1]) * half)
+        paths = {outer.net: [O, (O[0] + u[0] * reach, O[1] + u[1] * reach)],
+                 inner.net: [I, G, (O[0] + s[0] * half + u[0] * reach, O[1] + s[1] * half + u[1] * reach)]}
+        items = {n: [self.trackItem(n, layer, a, b, rule.width, rule.clearance, 0) for a, b in zip(p, p[1:])]
+                 for n, p in paths.items()}
+        hits = [o for its in items.values() for it in its for o in self.check(it)]
+        if hits or not self.pairClear(items[outer.net], items[inner.net]):
+            what = ", ".join(sorted({f"{self.netName.get(o.net, 'no net')} {o.kind}"
+                                     + (f" {o.pad.ref}.{o.pad.num}" if o.kind == "pad" else "")
+                                     for o in hits})) or "its own partner"
+            self.log(f"WARNING: pair {outer.net}/{inner.net} cannot escape {padL.ref} on the side the "
+                     f"other pairs use: {what} in the way")
+            return None
+        ends = [p[-1] for p in paths.values()]
+        return dict(paths=paths, items=items, u=u, layer=layer,
+                    mid=((ends[0][0] + ends[1][0]) / 2, (ends[0][1] + ends[1][1]) / 2))
     PAIR_RETRY_SEARCHES = 16   # searches the side retries may take: every combination once, and a few more
 
     def pairEndSlots(self, lead, res):
@@ -1716,6 +1931,7 @@ class Router:
         cy, cx = sp.cellCenters(win)
 
         walls = np.zeros((i1 - i0, j1 - j0), bool)
+        noVia = np.zeros((i1 - i0, j1 - j0), bool)
         slots = []   # (mid, outward unit, length) of each slotted end, start first
 
         def ends(a, b, items, side, spec=None):
@@ -1743,17 +1959,25 @@ class Router:
                 disk = lane & (out > 0) & (out <= r + 1.5)
             else:
                 out = None
+            stages = [int(disk.sum())]
             pads = np.zeros((i1 - i0, j1 - j0), bool)
             for it in items:
                 self.paint(pads, win, it)
             if pads.any():
                 disk &= edt(pads) * k.grid >= half + rule.width / 2 + rule.clearance
+            stages.append(int(disk.sum()))
             # and room for both tracks' starts beside the centreline, exactly
             need = half + rule.width / 2 + rule.clearance + 2 * k.grid
             for li, l in enumerate(layers):
                 if all(l in it.layers for it in items):
-                    m[li] = disk & (sp.foreignDist(0, l, win, nets=(-1,)) >= need)
+                    m[li] = disk & (self.clearDist(0, l, win, rule.clearance, nets=(-1,)) >= need)
+            stages.append(int(m.sum()))
             m &= cost >= 0
+            stages.append(int(m.sum()))
+            if os.environ.get("HR_TRACE_PAIR") and not m.any():
+                self.log(f"pair {lead.net}/{follow.net}: no cells at {a.ref}.{a.num}/{b.ref}.{b.num}: "
+                         f"near {stages[0]}, clear of the pads {stages[1]}, room beside {stages[2]}, "
+                         f"routable {stages[3]}")
             if out is not None and m.any():
                 # only the slot's inner end: the centreline then has to run out along it,
                 # far enough (SLOT_MM) to set its direction, between walls, and closed behind
@@ -1765,13 +1989,19 @@ class Router:
                 beside = np.abs(along) <= half + 0.5
                 walls[(~lane) & beside & (out > -0.1) & (out <= length - k.grid)] = True
                 walls[beside & (out <= 0) & (out > -(half + 1.0))] = True
+                # and no layer change along it: the two vias need the slot behind them to
+                # splay apart, or one net's track runs through the other's via
+                noVia[(np.abs(along) <= hv + rule.viaDia) & (out <= length + 2 * hv)] = True
             return m
-        src = ends(lead.a, follow.a, srcItems, sides[0], keep[0] if not sides[0] else None)
-        dst = ends(lead.b, follow.b, dstItems, sides[1], keep[1] if not sides[1] else None)
+        # an end a BGA escape fixes leaves straight ahead from where the escape stops
+        fs, fd = self.forcedEnds
+        src = ends(lead.a, follow.a, srcItems, 0 if fs else sides[0], fs or (keep[0] if not sides[0] else None))
+        dst = ends(lead.b, follow.b, dstItems, 0 if fd else sides[1], fd or (keep[1] if not sides[1] else None))
         if walls.any():
             cost[:, walls] = -1
             src &= cost >= 0
             dst &= cost >= 0
+        viaok[noVia] = 0
         for x, y, rr in avoid:
             spot = (cx - x) ** 2 + (cy - y) ** 2 <= rr * rr
             src &= ~spot[None]
@@ -1876,8 +2106,12 @@ class Router:
             nb = (-(uin[1] + uout[1]), uin[0] + uout[0])
             L = math.hypot(*nb)
             nb = (nb[0] / L, nb[1] / L) if L > 1e-6 else (-uin[1], uin[0])
+            # at a turn only part of the splay is sideways to the tracks running in and
+            # out: splay further, so each via stays clear of the other net's track
+            side = min(abs(uin[0] * nb[1] - uin[1] * nb[0]), abs(uout[0] * nb[1] - uout[1] * nb[0]))
+            reachV = max(hv, (rule.viaDia / 2 + w / 2 + rule.clearance - half) / max(side, 0.3))
             for sign in (1, -1):
-                viaPos[(ri, sign)] = (V[0] + nb[0] * sign * hv, V[1] + nb[1] * sign * hv)
+                viaPos[(ri, sign)] = (V[0] + nb[0] * sign * reachV, V[1] + nb[1] * sign * reachV)
         plan = []   # per net: (conn, [(layer, points)], via points)
         for conn, sign in ((lead, sA0), (follow, sB0)):
             d = sign * half
@@ -2068,8 +2302,10 @@ class Router:
         bad = [it for it in itemsA + itemsB if self.check(it)]
         if bad or self.viaSpacing(itemsA) or self.viaSpacing(itemsB) or not self.pairClear(itemsA, itemsB):
             if os.environ.get("HR_TRACE_PAIR"):
+                close = [(round(a.geom.distance(b.geom), 3), a.pts, b.pts) for a in itemsA for b in itemsB
+                         if set(a.layers) & set(b.layers) and a.geom.distance(b.geom) < max(a.clearance, b.clearance) - 1e-6]
                 self.log(f"pair {lead.net}/{follow.net}: {len(bad)} pieces fail the exact check, "
-                         f"cross clear {self.pairClear(itemsA, itemsB)}: "
+                         f"cross clear {self.pairClear(itemsA, itemsB)} {sorted(close)[:2]}: "
                          + "; ".join(f"{it.kind} {it.layers[0]} {it.pts} w{it.width} hits "
                                      f"{[(o.kind, o.tag, self.netName.get(o.net, o.net), o.layers, o.pts) for o in self.check(it)]}"
                                      for it in bad[:3]))
@@ -2078,14 +2314,67 @@ class Router:
 
     def routePair(self, lead, follow, layers, winPads, viaMm=None):
         """Lay both nets of a pair together; True when both are now routed. Tried once per
-        pair (repairPair asks again at the end). When the cheapest centreline cannot be laid
-        (the two nets would cross, or one's legs would run into the other's pad), the search
-        runs again with each end kept on one side of its pad pair, and the shortest of those
-        that lays cleanly is used."""
+        pair (repairPair asks again at the end). An end on two neighbouring balls of a BGA
+        escapes the ball grid first (pairEscape), one on two neighbouring pins of a row runs
+        straight out of them (rowEscape)."""
         if lead.routed or follow.routed or self.connected(lead) or self.connected(follow) \
                 or lead.pairTried:
             return False
         lead.pairTried = follow.pairTried = True
+        holder = lead if lead.escapes is not None else follow if follow.escapes is not None else None
+        reserved = holder is not None
+        if holder is not None:
+            self.fronts.pop(id(holder), None)
+        found = holder.escapes if reserved else self.findEscapes(lead, follow)
+        if holder is not None:
+            holder.escapes = None
+        esc = {end: e for end, pad in ((0, lead.a), (1, lead.b)) for e in found
+               if pad is not None and e["paths"][lead.net][0] == pad.center}
+        if not esc:
+            laid = self.findPair(lead, follow, layers, winPads, viaMm)
+        else:
+            # out of the pins first: the escapes' tracks are down (reserved before any pair
+            # was routed, or now), and the pair is found from where they end, as if the
+            # pins were there, leaving straight ahead
+            added, views = [it for e in esc.values() for its in e["items"].values() for it in its], []
+            if not reserved:
+                for it in added:
+                    self.sp.add(it)
+                    self.netItems.setdefault(it.net, set()).add(it.iid)
+            for conn in (lead, follow):
+                v = copy.copy(conn)
+                for end, e in esc.items():
+                    pad = conn.a if end == 0 else conn.b
+                    setattr(v, "a" if end == 0 else "b",
+                            EscapeEnd(pad, e["paths"][conn.net][-1], e["layer"], e["items"][conn.net]))
+                views.append(v)
+            self.forcedEnds = tuple((esc[end]["mid"], esc[end]["u"]) if end in esc else None for end in (0, 1))
+            try:
+                laid = self.findPair(views[0], views[1], layers, winPads, viaMm)
+            finally:
+                self.forcedEnds = (None, None)
+                for it in added:
+                    self.sp.remove(it.iid)
+                    self.netItems[it.net].discard(it.iid)
+                    it.stamped = []
+            if laid is not None:
+                laid = tuple([it for e in esc.values() for it in e["items"][conn.net]] + items
+                             for conn, items in zip((lead, follow), laid))
+            if os.environ.get("HR_TRACE_PAIR"):
+                at = ", ".join(sorted({(lead.a if end == 0 else lead.b).ref for end in esc}))
+                self.log(f"pair {lead.net}/{follow.net}: escaped the pins of {at}"
+                         f"{'' if laid else '; no pair from there'}")
+        if laid is None:
+            return False
+        self.commitPair(lead, laid[0])
+        self.commitPair(follow, laid[1])
+        return True
+
+    def findPair(self, lead, follow, layers, winPads, viaMm):
+        """Both nets' items for a pair laid together, or None. When the cheapest
+        centreline cannot be laid (the two nets would cross, or one's legs would run into
+        the other's pad), the search runs again with each end kept on one side of its pad
+        pair, and the shortest of those that lays cleanly is used."""
         trace = os.environ.get("HR_TRACE_PAIR")
         retried = False     # the side retries run once: a wider window does not move the pads
         for reach in (0.0, self.k.pairStartMm, 2 * self.k.pairStartMm):   # between the pads first, then near them
@@ -2103,11 +2392,9 @@ class Router:
                         if self.pairCrossed:
                             break
                         continue        # or a raster error: once more with margin
-                    self.commitPair(lead, laid[0])
-                    self.commitPair(follow, laid[1])
                     if trace:
                         self.log(f"pair {lead.net}/{follow.net}: laid together")
-                    return True
+                    return laid
                 if retry and not retried:
                     retried = True
                     best = None
@@ -2143,13 +2430,11 @@ class Router:
                         if best is None or length < best[0]:
                             best = (length, laid, sides)
                     if best is not None:
-                        self.commitPair(lead, best[1][0])
-                        self.commitPair(follow, best[1][1])
                         if trace:
                             self.log(f"pair {lead.net}/{follow.net}: laid together from the side that keeps "
                                      f"the polarity {best[2]} ({best[0]:.1f} mm of track)")
-                        return True
-        return False
+                        return best[1]
+        return None
 
     # ---- differential pairs -------------------------------------------------------------
     def coupling(self, c1, c2, reach=0.35):
@@ -2252,6 +2537,8 @@ class Router:
                 break
             if self.joinedByOthers(it, r):
                 continue   # another route joins this piece: bending it would leave that one hanging
+            if any(c.intersects(it.geom) for c in self.gridCourtyards()):
+                continue   # under a BGA there is room for one track between balls, not for bumps
             pitch = max(3 * it.width, it.width + it.clearance)
             done = False
             for amp in (amax, amax * 0.6, amax * 0.35):
