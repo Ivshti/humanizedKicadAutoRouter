@@ -67,6 +67,10 @@ class Knobs:
                                  # other outer layer is left to the bundles (relaxed only for a
                                  # connection that cannot be routed that way)
     bodyMinAreaMm2: float = 40.0
+    jumps: bool = True           # a signal may pass under a two-pad part (an 0402 resistor),
+                                 # straight between its pads, at exact clearance: a person's
+                                 # "jump" (the Ambire signer's owner, 2026-10-23)
+    jumpMult: float = 1.3        # cost of a cell in such a jump channel
     stitchPitchMm: float = 4.0
     stitch: bool = True          # stitch the outer ground pours to the plane after routing
     stitchPadGapMm: float = 0.5  # bare board between a stitching or return via and any pad
@@ -354,6 +358,68 @@ class Router:
                 self.ruleAreas[i0:i1, j0:j1] |= mask
         self.loadStrategyRasters()
 
+    def findJumpChannels(self):
+        """Gaps a signal may cross under a two-pad SMD part (resistor, capacitor): the
+        straight line midway between the pads' facing edges, across the pads' common
+        width plus a lead-in at each end. A person routes a 0.15 mm track under an 0402
+        (0.48 mm between its pads) with 0.165 mm either side: legal at the design
+        clearance, but not with the search's safety margin on top, so these channels are
+        judged at exact clearance, one grid column wide. Only parts square to the grid:
+        a column of cell centres then lies within half a cell of the line."""
+        out = []
+        for fp in self.m.footprints.values():
+            pads = fp.pads
+            if len(pads) != 2 or not all(p.smd for p in pads):
+                continue
+            a, b = pads
+            layers = [l for l in a.layers if l in (F, B) and l in b.layers]
+            if not layers:
+                continue
+            (ax, ay), (bx, by) = a.center, b.center
+            dx, dy = bx - ax, by - ay
+            L = math.hypot(dx, dy)
+            if L < 1e-6 or min(abs(dx), abs(dy)) > 1e-3:   # not square to the grid
+                continue
+            ux, uy = dx / L, dy / L                         # pad to pad
+            vx, vy = -uy, ux                                # across the gap
+            pa = [((x - ax) * ux + (y - ay) * uy, (x - ax) * vx + (y - ay) * vy) for x, y in a.poly.exterior.coords]
+            pb = [((x - ax) * ux + (y - ay) * uy, (x - ax) * vx + (y - ay) * vy) for x, y in b.poly.exterior.coords]
+            s1, s2 = max(u for u, _ in pa), min(u for u, _ in pb)
+            v0 = max(min(v for _, v in pa), min(v for _, v in pb))
+            v1 = min(max(v for _, v in pa), max(v for _, v in pb))
+            if s2 - s1 <= 0 or v1 <= v0:
+                continue
+            uc = (s1 + s2) / 2
+            out.append(dict(ref=fp.ref, layers=layers, gap=s2 - s1, nets={a.net, b.net},
+                            pads=(a, b), origin=(ax, ay), u=(ux, uy), v=(vx, vy), uc=uc, v0=v0, v1=v1))
+        return out
+
+    def jumpMask(self, conn, rule, l, win):
+        """Cells of the jump channels this connection may use on layer l, within win."""
+        i0, j0, i1, j1 = win
+        mask = np.zeros((i1 - i0, j1 - j0), bool)
+        if conn.kind != "sig":
+            return mask
+        for jc in self.jumpChannels:
+            if l not in jc["layers"] or conn.net in jc["nets"]:
+                continue
+            clr = max([rule.clearance] + [self.rules[n].clearance if n in self.rules else self.sp.defaultClearance
+                                          for n in jc["nets"]])
+            slack = jc["gap"] / 2 - rule.width / 2 - clr
+            if slack < 0:
+                continue
+            ax, ay = jc["origin"]
+            (ux, uy), (vx, vy) = jc["u"], jc["v"]
+            lead = rule.width / 2 + clr + self.k.margin      # out past the pads' ends
+            p = lambda vv: (ax + jc["uc"] * ux + vv * vx, ay + jc["uc"] * uy + vv * vy)
+            cwin, cells = self.sp.segMask(p(jc["v0"] - lead), p(jc["v1"] + lead), slack)
+            c0, d0 = max(cwin[0], i0), max(cwin[1], j0)
+            c1, d1 = min(cwin[2], i1), min(cwin[3], j1)
+            if c1 <= c0 or d1 <= d0:
+                continue
+            mask[c0 - i0:c1 - i0, d0 - j0:d1 - j0] |= cells[c0 - cwin[0]:c1 - cwin[0], d0 - cwin[1]:d1 - cwin[1]]
+        return mask
+
     def loadStrategyRasters(self):
         """Human conventions as rasters: no foreign copper under module/antenna bodies,
         keep GND thermal spokes free, and a static distance-to-hole field."""
@@ -378,6 +444,7 @@ class Router:
             i0, j0, i1, j1 = win
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
             self.bodyViaKeep[i0:i1, j0:j1] |= mask
+        self.jumpChannels = self.findJumpChannels() if k.jumps else []
         self.thermalCost = np.zeros((NLAYERS, sp.H, sp.W), np.float32)
         for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
             if not pad.smd:
@@ -540,6 +607,12 @@ class Router:
                 soft = okFix & ~ok
                 ok = okFix
                 wideOk[li] = dFix >= rW
+            jump = self.jumpMask(conn, rule, l, win) if self.jumpChannels else None
+            if jump is not None and jump.any():
+                # a jump: the two pads it passes are rasterised, so they read up to a cell
+                # nearer than they are; anything else must still clear the full rule
+                d = dFix if negotiate else dAll
+                ok |= jump & (d >= rule.width / 2 + rule.clearance - g)
             ok &= ~sp.trackKeep[l, i0:i1, j0:j1]
             for fl, cells in self.frontsIn(win):
                 if fl == l:
@@ -566,6 +639,8 @@ class Router:
                 c[~inside & ~escape] *= k.corridorOut
             if soft is not None:
                 c[soft] *= (1.0 + k.negotiatePenalty)
+            if jump is not None and jump.any():
+                c[jump] *= k.jumpMult
             c[~ok] = -1
             cost[li] = c
         # own pad interiors: always enterable by a track that stays inside the pad
