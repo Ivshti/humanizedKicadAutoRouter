@@ -36,6 +36,11 @@ class Knobs:
     seed: int = 0                # 0: the routing order as planned; another: each connection's
                                  # place in it shaken a little (reproducibly), to try other orders
     powerWidth: dict = field(default_factory=lambda: {"Power": 0.5, "Rail": 0.3})
+    fatten: bool = False         # power copper widened to the widest that fits (2 mm down to
+                                 # 0.6 mm, capped by the pads it lands on), so a net's tracks
+                                 # overlap into a small pour. Off: a power track keeps its class
+                                 # width, or the width its --flows current needs (the Ambire
+                                 # signer's owner, 2026-10-23: "random slabs of thick trace")
     turn45Mm: float = 0.1
     turn90Mm: float = 0.5
     viaMm: float = 5.0
@@ -63,6 +68,11 @@ class Knobs:
                                  # via only if the pour misses them; "none" = every pad takes
                                  # the pour, stitching feeds it and a pad it misses is reported.
                                  # Pads of plane nets with no outer pour always get their via.
+    gndRepair: str = "report"    # under fanoutParts "none", a GND pad the pour misses after
+                                 # routing: "report" lists it and adds no copper (the designer
+                                 # decides; the Ambire signer's owner, 2026-10-23: router GND
+                                 # tracks are slop); "join" ties it: a track to the pour, a via
+                                 # in an exposed pad or a chip's pin ring, a via beside it last
     blockLayer: str = "free"     # "own": wiring inside a block stays on its parts' layer, the
                                  # other outer layer is left to the bundles (relaxed only for a
                                  # connection that cannot be routed that way)
