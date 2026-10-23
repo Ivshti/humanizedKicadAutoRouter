@@ -101,6 +101,23 @@ def negotiate(router, queue, log, maxRounds=40, deadline=None, winPads=None):
                 router.commit(c, res, items)
             # a ripped stitching via is not put back: the field has vias to spare
             queue += [r for r in ripped if r is not c and r.kind != "stitch"]
+        elif st == "nudge":
+            # only the designer's copper is in the way: nudge it aside (Router.nudge), the
+            # routes in the way as well ripped and queued again as for a conflict
+            res, items, victims, pieces = payload
+            ripped = []
+            for v in victims:
+                router.rip(v, ripped)
+
+            def place(c=c, res=res, items=items):
+                if any(o.route not in pieces for it in items for o in router.check(it)):
+                    return None
+                router.commit(c, res, items)
+                return [c.rid]
+            if not router.nudge(pieces, place, log):
+                router.nudgeRefused.add((c.cid, frozenset(pieces)))
+                queue.append(c)
+            queue += [r for r in ripped if r is not c and r.kind != "stitch"]
         elif st != "ok":
             queue.append(c)
     return rounds
@@ -752,6 +769,8 @@ def main():
     router.flowNets = {f["net"] for f in flows}
     conns, block, bundles = plan(model, router, log, flows)
     router.allConns = conns
+    if router.k.nudge:
+        log(f"nudge: {router.markMovable()} pieces of the designer's copper may be nudged aside")
     total = len(conns)
     if args.route == "blocks":
         conns = [c for c in conns if c.kind == "gnd" or not c.bundle]
