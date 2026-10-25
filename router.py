@@ -59,6 +59,12 @@ class Knobs:
     thermalHard: bool = True     # other nets may not cross those corridors at all (except
                                  # within 0.3 mm of their own pads, to get out of a pin row)
     fanoutViaGapMm: float = 0.25 # bare board between a GND fanout via's ring and any pad edge
+    viaPadGapMm: float = 0.2     # bare board between any via's ring and any pad edge, its own
+                                 # net's too (a via crowding a pad, or in it, reads as a defect:
+                                 # the Ambire signer's owner, 2026-10-25); GND fanouts use
+                                 # fanoutViaGapMm
+    hopMaxMm: float = 6.0        # a route that drops a layer and comes straight back within
+                                 # this much is laid on its own layer when that fits (was 1 mm)
     fanoutInsideMult: float = 3.0  # a fanout pays this much more where its via does not belong:
                                  # inside a small part's outline (via on the far side), or just
                                  # outside a chip's pin ring (via inside the ring, under the body)
@@ -702,6 +708,8 @@ class Router:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
         # one cell of raster slack: a pad corner can rasterise one cell short
         viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: np.isin(a, nets)) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
+        if k.viaPadGapMm > 0:
+            viaok &= self.padEdgeDist[i0:i1, j0:j1] >= rv + k.viaPadGapMm + g
         viaok &= self.holeDist[i0:i1, j0:j1] >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: np.isin(a, nets)) >= \
             rule.viaDrill + self.m.minHoleToHole + m
@@ -1307,14 +1315,14 @@ class Router:
 
         def clean(pts):
             return all(self.octilinear(a, b) and math.dist(a, b) > 1e-6 for a, b in zip(pts, pts[1:]))
-        # a hop: down a layer and back up within a millimetre, where staying would do
+        # a hop: down a layer and back up within hopMaxMm, where staying would do
         k = 0
         while k + 2 < len(tight):
             la, A, wa = tight[k]
             lm, Mp, wm = tight[k + 1]
             lc, C, wc = tight[k + 2]
             hop = sum(math.dist(a, b) for a, b in zip(Mp, Mp[1:]))
-            if la == lc and A and C and hop < 1.0:
+            if la == lc and A and C and hop < self.k.hopMaxMm:
                 P, Q = A[-1], C[0]
                 link = None
                 for corner in self.legs(P, Q):
