@@ -54,3 +54,17 @@ CELL_N_SENSE alone makes five hops on one net.
    within a few mm should pay for it, so the router tries ripping the crossed net first.
 3. Retire "track to the pour" from `gndRepair=join`, or make it a separate opt-in.
    This owner wants a pad the pour misses reported, never a track laid into fill.
+
+## Addendum: the boost's feedback cluster (owner: "excuse me?")
+
+R_FB1 pin 1 at about (36.4, 72.5) and C_BOOST pin 1 at about (36.1, 68.1) are both
+V_BOOST pads on F.Cu, 4 mm apart with nothing between them on the front. The router
+joined them with two vias, at (36.12, 69.05) and (36.25, 72.47), and 3.5 mm of B.Cu,
+then put a GND return via in the gap between those two vias. That leaves a sliver of
+pour around it, 0.1–0.2 mm from the pads.
+
+- A return via must not be forced into a gap that small.
+- A return via is pointless where the "signal" via is itself a needless hop.
+
+`routeDefects.py` (board repo) now also lists vias within 0.2 mm of a pad (24 new in this
+pass), tracks passing between a two-pad part's pads, and acute V-turns.
