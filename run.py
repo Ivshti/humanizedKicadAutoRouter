@@ -26,7 +26,8 @@ from boardModel import (B, F, IN1, IN2, boardPlanes, existingCopper, fillZones, 
                         loadModel, polySetToShapely, readCourtyardClearances, readSkewRules, ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
-from router import Knobs, Router
+from flowcheck import squeezes
+from router import Knobs, Router, ipcWidth
 from strategy import followLeaders, pairPartners, phaseOrder, plan
 from tidy import Judge, tidy
 
@@ -588,8 +589,17 @@ def cleanup(router, log, deadline=None, rounds=2):
         c = router.routes[rid].conn if rid in router.routes else None
         if c is not None:
             router.improve(rid, layersFor(c), winPadsFor(c), viaMmFor(c, k) * k.viaCleanupMult)
+    # a signal that hops a track with two vias: the track makes room instead
+    unhopped = 0
+    for rid in sorted(router.routes):
+        if deadline and time.perf_counter() > deadline:
+            break
+        r = router.routes.get(rid)
+        if r is not None and r.conn.kind in ("sig", "pwr") and \
+                router.unhop(rid, layersFor, winPadsFor, lambda c: viaMmFor(c, k)):
+            unhopped += 1
     after = sum(router.routeCost(rid)[1] for rid, r in router.routes.items() if r.conn.kind in ("sig", "pwr"))
-    log(f"via cleanup: {before} -> {after} signal/power vias")
+    log(f"via cleanup: {before} -> {after} signal/power vias ({unhopped} hops undone by moving what they crossed)")
     audit(router, log, "via cleanup")
     # straighten: every route searched once more with corners priced high, kept when it
     # has fewer of them and is no longer
@@ -884,6 +894,17 @@ def main():
             drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
     viol = Counter(v["type"] for v in drc["violations"])
     log(f"DRC: {sum(viol.values())} violations {dict(viol)}, {len(drc['unconnected_items'])} unconnected")
+    if flows:
+        want = lambda net, amps: max(router.rules[net].width, ipcWidth(amps, router.k))
+        bad = squeezes(board, flows, want, router.k.neckMm)
+        for f, sink, w, thin in bad:
+            where = f"{f['net']} {f['source']} -> {sink} ({f['amps']} A, trunk {w:.2f} mm)"
+            if thin is None:
+                log(f"WARNING current path {where}: no copper path")
+                continue
+            log(f"WARNING current path {where} runs through thinner copper: " +
+                ", ".join(f"{L} mm at {tw} mm on {layer} near {xy}" for tw, L, layer, xy in thin))
+        log(f"current paths: {len(bad)} of the flows squeezed")
     if router.droppedUuids:
         log(f"moved: {len(router.droppedUuids)} tracks and vias an earlier run drew were ripped to make room")
     log(f"router copper recorded: {writeRouterCopper(board, os.path.join(args.out, name + SIDECAR), designer)} "

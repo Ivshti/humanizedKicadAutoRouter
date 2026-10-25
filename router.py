@@ -281,7 +281,7 @@ class Router:
                                base.viaDrill, base.cls)
             return base
         need = ipcWidth(conn.amps, self.k)
-        width = max(base.width if conn.kind != "pwr" else classWidth, need)
+        width = max(base.width, need)
         pads = [p for p in (conn.a, conn.b) if p is not None]
         padMin = min(padMinDim(p) for p in pads)
         narrow = min(width, max(base.narrow, padMin))
@@ -1026,9 +1026,15 @@ class Router:
                         continue
                     if j == len(pts) - 1 and onTrack[1] and math.dist(path[-2], path[-1]) < self.MIN_LEG:
                         continue
-                    if self.pathOk(conn, layer, path, wj, rule):
-                        chosen, nxt = (path, wideHere), j
-                        break
+                    if not self.pathOk(conn, layer, path, wj, rule):
+                        continue
+                    # a shortcut out of a neck must not carry the neck's width past it
+                    if not wideHere and any(width(a, b, False) < rule.width - 1e-6
+                                            and not self.inNeck(conn, a, b, rule)
+                                            for a, b in zip(path, path[1:])):
+                        continue
+                    chosen, nxt = (path, wideHere), j
+                    break
                 if chosen:
                     break
             path, wideHere = chosen if chosen else ([pts[kidx], pts[nxt]], all(wide[kidx:nxt + 1]))
@@ -1060,6 +1066,12 @@ class Router:
         seg = LineString([p, q]) if p != q else Point(p)
         return any(pad is not None and padMinDim(pad) < rule.width - 1e-6
                    and seg.distance(pad.poly) < self.k.neckMm + 1e-6 for pad in (conn.a, conn.b))
+
+    def inNeck(self, conn, p, q, rule):
+        """Whether all of p-q lies within neckMm of an end pad narrower than the track."""
+        return any(pad is not None and padMinDim(pad) < rule.width - 1e-6
+                   and pad.poly.distance(Point(p)) < self.k.neckMm + 1e-6
+                   and pad.poly.distance(Point(q)) < self.k.neckMm + 1e-6 for pad in (conn.a, conn.b))
 
     MIN_LEG = 0.1   # mm; KiCad's connectivity ignores a shorter piece at a T junction
 
@@ -1421,6 +1433,73 @@ class Router:
             # itself was holding together: nothing to put back
             return True
         self.restore(r)
+        return False
+
+    def hopBlockers(self, rid):
+        """For a route between two pads on one side that leaves that side: the layer it
+        belongs on, and the other routes it hops (those with track on that layer over its
+        runs on the other layers). None when it is not such a route."""
+        r = self.routes.get(rid)
+        c = r.conn if r is not None else None
+        if c is None or c.b is None or not (c.a.smd and c.b.smd) or c.a.side != c.b.side:
+            return None
+        home = c.a.side
+        items = [self.sp.items[i] for i in r.items]
+        away = [it for it in items if it.kind == "track" and it.layers[0] != home]
+        if not away or not any(it.kind == "via" for it in items):
+            return None
+        blockers = set()
+        for it in away:
+            for o in self.sp.query([home], it.geom.bounds):
+                if o.kind == "track" and o.route and o.route != rid and o.route in self.routes \
+                        and o.geom.intersects(it.geom):
+                    blockers.add(o.route)
+        return home, blockers
+
+    def unhop(self, rid, layersOf, winPadsOf, viaMmOf, maxBlockers=2):
+        """A person does not hop a signal over a track with two vias when the track can make
+        room: rip the hopping route and the routes it hops, lay the hopping one on its own
+        side with no via, then the others again; kept only if every one of them is routed,
+        with fewer vias and less length (vias priced viaCleanupMult times higher)."""
+        found = self.hopBlockers(rid)
+        if not found:
+            return False
+        home, blockers = found
+        group = [rid] + sorted(blockers)
+        if not blockers or len(blockers) > maxBlockers or any(
+                self.children.get(g) or self.routes[g].paired for g in group):
+            return False
+        price = self.k.viaMm * self.k.viaCleanupMult
+
+        def cost(rids):
+            total, vias = 0.0, 0
+            for g in rids:
+                L, n = self.routeCost(g)
+                total += L - n * self.k.viaMm + n * price
+                vias += n
+            return total, vias
+        before, viasBefore = cost(group)
+        old = [self.routes[g] for g in group]
+        for r in old:
+            r.oldItems = [self.sp.items[i] for i in r.items]
+        for g in group:
+            self.rip(g)
+        new = []
+        ok = True
+        for r, layers in zip(old, [[home]] + [layersOf(r.conn) for r in old[1:]]):
+            st, nr = self.route(r.conn, layers, winPadsOf(r.conn), viaMm=viaMmOf(r.conn))
+            if st != "ok" or nr is None:
+                ok = False
+                break
+            new.append(nr.rid)
+        if ok:
+            after, viasAfter = cost(new)
+            if viasAfter < viasBefore and after < before:
+                return True
+        for g in new:
+            self.rip(g)
+        for r in old:
+            self.restore(r)
         return False
 
     def nodesJoined(self, r):
@@ -2759,44 +2838,139 @@ class Router:
         return None
 
     def fatten(self, nets, widths=(2.0, 1.6, 1.3, 1.0, 0.8, 0.6)):
-        """Power copper the way a person pours it with tracks: every power track widened to
-        the widest that fits, so neighbouring tracks of the net overlap into one area. A
-        track ending on a pad grows no wider than that pad, and none covers a GND pad's
-        thermal spokes."""
-        sp = self.sp
+        """Power copper the way a person lays it with tracks: each run of a route (its
+        stretch on one layer) widened as one, to the widest width that fits along all of it,
+        so a trunk keeps one width from via to via (no neck where the room runs out). No
+        run is wider than the route's longest run (no stub fatter than its trunk), and a tap
+        no wider than the copper it joins. Where a run lands on a pad narrower than its
+        width it necks to the pad's size for the last stretch only, and no track covers a
+        GND pad's thermal spokes. Trunks (routes that carry a planned current) go first."""
         grown = 0
-        for r in list(self.routes.values()):
-            if r.conn.net not in nets:
+        routes = sorted((r for r in self.routes.values() if r.conn.net in nets),
+                        key=lambda r: (-r.conn.amps, r.rid))
+        for r in routes:
+            runs = self.runsOf(r)
+            if not runs:
                 continue
-            for idx, iid in enumerate(r.items):
-                it = sp.items[iid]
-                if it.kind != "track":
-                    continue
-                layer = it.layers[0]
-                cap = max(widths)
-                for p in it.pts:
-                    pad = self.padUnder(r.conn.net, layer, p)
-                    if pad is not None:
-                        minx, miny, maxx, maxy = pad.poly.bounds
-                        cap = min(cap, max(it.width, maxx - minx, maxy - miny))
-                for w in widths:
-                    if w <= it.width + 1e-6 or w > cap + 1e-6:
-                        continue
-                    new = self.trackItem(r.conn.net, layer, it.pts[0], it.pts[1], w, it.clearance, r.rid)
-                    if self.check(new):
-                        continue
-                    wwin, mask = sp.rasterMask(new.geom)
-                    i0, j0, i1, j1 = wwin
-                    if mask.size and (self.thermalCost[layer, i0:i1, j0:j1][mask] > 0).any():
-                        continue
-                    sp.remove(iid)
-                    self.netItems[it.net].discard(iid)
-                    sp.add(new)
-                    self.netItems[new.net].add(new.iid)
-                    r.items[idx] = new.iid
+            cap = self.joinedWidth(r) if r.conn.amps <= 0 else max(widths)
+            fits = []
+            for run in runs:
+                now = max(self.sp.items[r.items[i]].width for i in run)
+                fit = next(((w, plan) for w in widths if now + 1e-6 < w <= cap + 1e-6
+                            for plan in [self.widenPlan(r, run, w)] if plan is not None), (now, None))
+                fits.append((sum(math.dist(*self.sp.items[r.items[i]].pts) for i in run), now, fit))
+            trunk = max(fits, key=lambda f: f[0])[2][0]
+            new = {}
+            for run, (_, now, (w, plan)) in zip(runs, fits):
+                if plan is not None and w > trunk + 1e-6:
+                    w = max((x for x in widths if now + 1e-6 < x <= trunk + 1e-6), default=None)
+                    plan = self.widenPlan(r, run, w) if w is not None else None
+                if plan is not None:
+                    new.update(plan)
                     grown += 1
-                    break
+            self.swapTracks(r, new)
         return grown
+
+    def runsOf(self, r):
+        """A route's tracks as runs: indices into r.items, one list per stretch of joined
+        track on one layer."""
+        idx = [i for i, iid in enumerate(r.items) if self.sp.items[iid].kind == "track"]
+        parent = {i: i for i in idx}
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for x in idx:
+            for y in idx:
+                a, b = self.sp.items[r.items[x]], self.sp.items[r.items[y]]
+                if x < y and a.layers == b.layers and any(math.dist(p, q) < 1e-3 for p in a.pts for q in b.pts):
+                    parent[find(x)] = find(y)
+        runs = {}
+        for i in idx:
+            runs.setdefault(find(i), []).append(i)
+        return list(runs.values())
+
+    def joinedWidth(self, r):
+        """The widest track of the net, not this route's, that this route's tracks touch
+        (a tap's trunk); unlimited when it touches none (pad to pad)."""
+        mine = set(r.items)
+        best = 0.0
+        for iid in r.items:
+            t = self.sp.items[iid]
+            if t.kind != "track":
+                continue
+            for p in t.pts:
+                for it in self.sp.query(list(t.layers), (p[0], p[1], p[0], p[1])):
+                    if it.kind == "track" and it.net == t.net and it.iid not in mine \
+                            and it.geom.distance(Point(p)) <= 1e-3:
+                        best = max(best, it.width)
+        return best if best > 0 else float("inf")
+
+    def widenPlan(self, r, run, w):
+        """The tracks of one run of route r at width w ({index in r.items: new items}), or
+        None if any of them does not fit. A track that ends on a pad narrower than w keeps
+        to the pad's size for its last neckMm past the pad's edge."""
+        sp = self.sp
+        new = {}
+        for idx in run:
+            it = sp.items[r.items[idx]]
+            layer = it.layers[0]
+            a, b = it.pts
+            L = math.dist(a, b)
+            necks = []    # (end, how far from it, width)
+            for end in (a, b):
+                pad = self.padUnder(r.conn.net, layer, end)
+                if pad is None:
+                    continue
+                minx, miny, maxx, maxy = pad.poly.bounds
+                size = max(maxx - minx, maxy - miny)
+                if max(it.width, size) < w - 1e-6:
+                    necks.append((end, size / 2 + self.k.neckMm, max(it.width, size)))
+            if not necks:
+                pieces = [(a, b, w)]
+            elif L <= sum(n[1] for n in necks) + 0.2:
+                pieces = [(a, b, min(n[2] for n in necks))]
+            else:
+                at = lambda d: (round(a[0] + (b[0] - a[0]) * d / L, 4), round(a[1] + (b[1] - a[1]) * d / L, 4))
+                cuts = [a, b]
+                width = {}
+                for end, reach, nw in necks:
+                    cuts.insert(1 if end == a else len(cuts) - 1, at(reach if end == a else L - reach))
+                    width[end] = nw
+                pieces = [(p, q, width.get(p, width.get(q, w))) for p, q in zip(cuts, cuts[1:])]
+            made = []
+            for p, q, wd in pieces:
+                cand = self.trackItem(r.conn.net, layer, p, q, wd, it.clearance, r.rid)
+                if self.check(cand):
+                    return None
+                wwin, mask = sp.rasterMask(cand.geom)
+                i0, j0, i1, j1 = wwin
+                if mask.size and (self.thermalCost[layer, i0:i1, j0:j1][mask] > 0).any():
+                    return None
+                made.append(cand)
+            new[idx] = made
+        return new
+
+    def swapTracks(self, r, new):
+        """Replace tracks of route r ({index in r.items: new items}), keeping the order."""
+        if not new:
+            return
+        sp = self.sp
+        items = []
+        for idx, iid in enumerate(r.items):
+            if idx not in new:
+                items.append(iid)
+                continue
+            net = sp.items[iid].net
+            sp.remove(iid)
+            self.netItems[net].discard(iid)
+            for cand in new[idx]:
+                sp.add(cand)
+                self.netItems[cand.net].add(cand.iid)
+                items.append(cand.iid)
+        r.items = items
 
     # ---- plane stitching ----------------------------------------------------------------
     def stitchMask(self, net="GND", padGap=None):

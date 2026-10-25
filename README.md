@@ -232,10 +232,15 @@ routing. The router always starts from a clean board, plus your inner planes.
 
 Without a flows file, power nets are routed at their net-class width. With one,
 each power net is laid out as a person would. A trunk runs from the source to
-each big consumer, sized by IPC-2221 for the current it actually carries, and
-never narrower than the net class's track width (a small current only ever
-widens a track). Small loads are tapped off it at the class width, and tracks
-neck down only at the pins.
+each big consumer, at least as wide as a power track (`powerWidth`) and wider
+if IPC-2221 asks for more for the current it carries. Small loads are tapped
+off it at the class width, and tracks neck down only at the pins.
+
+After the board is finished, the path each current really takes is followed
+through the copper. If it runs through anything thinner than its trunk (other
+than a short neck into a fine-pitch pin), the log says so, with a WARNING
+line naming the net, the thin stretch's length and width, and where it is.
+KiCad's DRC cannot see this: every track is legal on its own.
 
 ```json
 {
@@ -318,7 +323,11 @@ It follows the order a person uses:
    board remembers where the fights were.
 8. **Tidy up.** The worst detours are re-routed against the finished board.
    Then every route with vias is retried with vias priced much higher. A new
-   route is kept only if it is better. Then every route is retried once more
+   route is kept only if it is better. A connection between two pads on the
+   same side that still hops to the other layer to cross another route is
+   tried the way a person fixes it: both come up, the hopping one goes back
+   on its own side without vias, and the one it crossed finds another way;
+   kept only if both are routed with fewer vias. Then every route is retried once more
    with corners priced high and kept when it has fewer of them and is no
    longer. Finally a via that sits a short stub away from a pad is moved so
    the stub leaves the pad's centre in a straight line, along the pad's long
@@ -330,11 +339,14 @@ It follows the order a person uses:
    pair with no skew rule of its own that is off by several times the default
    budget took two different paths; it is reported and left alone rather than
    buried under bumps. So is a pair with no skew rule whose nets branch.
-10. **Power copper.** Every power track is widened to the widest that fits, so
-    neighbouring tracks of one net overlap into a small pour, the way a person
-    lays overlapping thick tracks. A track that ends on a pad grows no wider
-    than that pad. Nets in a net class named `Rail` are light rails and keep
-    their class width, unless `--flows` gives them a current.
+10. **Power copper.** Power tracks are widened where there is room, one run at
+    a time: a run (a track's stretch on one layer, from via to via or pad)
+    gets one width, the widest that fits along all of it, so a trunk never
+    necks where the room runs out. No stretch of a connection is wider than
+    its longest one, and a tap is no wider than the trunk it joins, so there
+    are no fat stubs. Into a pad narrower than the track, it narrows to the
+    pad's size just before the pad. Nets in a net class named `Rail` are light
+    rails and keep their class width, unless `--flows` gives them a current.
 11. **Return vias.** Every signal via without a ground via within 1.5 mm gets
     one within 2 mm, so the return current can change planes where the signal
     changes layers.
@@ -500,7 +512,9 @@ Numbers are from the reference board, compared with the same board routed by han
 - **More vias than a person uses.** About 160–180 signal/power vias against 77
   by hand. Most are escape vias next to the pins, two per long bundle member.
   Your hand-routed board keeps more long runs on top. Mid-route hops have come
-  down but are still several times the hand-routed count.
+  down but are still several times the hand-routed count. A short signal that
+  hops a power trunk with taps hanging off it keeps its hop: only routes with
+  nothing attached are moved out of the way.
 - **Differential pairs** are coupled where there is room, and pairs that end
   up apart are re-routed together. On the reference board USB comes out about
   half to two-thirds coupled, like the hand-routed board. The long CAN pair
