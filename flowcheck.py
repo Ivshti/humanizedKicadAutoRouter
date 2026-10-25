@@ -21,7 +21,8 @@ SHORT_OF = 0.85       # copper this much of the trunk's width or more counts as 
 
 def netCopper(board, net):
     """Tracks, vias and pads of one net as shapes: (kind, layers or None for all, shape,
-    width (pads and vias: unlimited), length, extra)."""
+    width (pads and vias: unlimited), length, extra). A pad's extra is (reference, its
+    narrow side, its long side); a track's is its centreline."""
     out = []
     for t in board.GetTracks():
         if t.GetNetname() != net:
@@ -48,7 +49,7 @@ def netCopper(board, net):
                 Point(p.GetPosition().x / MM, p.GetPosition().y / MM).buffer(0.1)
             minx, miny, maxx, maxy = shape.bounds
             out.append(("pad", layers, shape, float("inf"), 0.0,
-                        (fp.GetReference(), max(maxx - minx, maxy - miny))))
+                        (fp.GetReference(), min(maxx - minx, maxy - miny), max(maxx - minx, maxy - miny))))
     return out
 
 
@@ -119,13 +120,15 @@ def squeezes(board, flows, want, neckMm, trunkMinAmps=0.3):
                 found.append((f, sink, w, None))
                 continue
             thin = []
-            for k, i in enumerate(path):
+            # pins on the path narrower than the trunk: a neck may run along one and
+            # neckMm past it, however many pieces it is drawn in
+            pins = [items[j][2] for j in path if items[j][0] == "pad" and items[j][5][1] < w]
+            for i in path:
                 kind, layers, shape, width, length, line = items[i]
                 if kind != "track" or width >= SHORT_OF * w - 1e-3:
                     continue
-                pads = [items[j] for j in (path[k - 1] if k else None, path[k + 1] if k + 1 < len(path) else None)
-                        if j is not None and items[j][0] == "pad"]
-                if any(size < w and length <= size / 2 + neckMm + NECK_SLACK_MM for *_, (_, size) in pads):
+                ends = [Point(p) for p in line.coords]
+                if any(max(e.distance(pin) for e in ends) <= neckMm + NECK_SLACK_MM for pin in pins):
                     continue
                 c = line.interpolate(0.5, normalized=True)
                 thin.append((round(width, 3), round(length, 2), board.GetLayerName(next(iter(layers))),

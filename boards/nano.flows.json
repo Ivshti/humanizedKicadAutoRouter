@@ -31,7 +31,8 @@
    "sinks": [
     "D_REV12"
    ],
-   "amps": 0.75
+   "amps": 0.75,
+   "minWidthMm": 0.8
   },
   {
    "net": "V12N",
@@ -39,7 +40,8 @@
    "sinks": [
     "U12"
    ],
-   "amps": 0.75
+   "amps": 0.75,
+   "minWidthMm": 0.8
   },
   {
    "net": "SW12",

@@ -237,9 +237,11 @@ if IPC-2221 asks for more for the current it carries. Small loads are tapped
 off it at the class width, and tracks neck down only at the pins.
 
 After the board is finished, the path each current really takes is followed
-through the copper. If it runs through anything thinner than its trunk (other
-than a short neck into a fine-pitch pin), the log says so, with a WARNING
-line naming the net, the thin stretch's length and width, and where it is.
+through the copper. If it runs through anything thinner than its trunk, the
+log says so, with a WARNING line naming the net, the thin stretch's length and
+width, and where it is. A short neck into a pin narrower than the trunk is not
+reported: it runs along the pin and at most `neckMm` past its end, which is
+how a person lands a wide track on a fine-pitch pin.
 KiCad's DRC cannot see this: every track is legal on its own.
 
 ```json
@@ -255,6 +257,18 @@ KiCad's DRC cannot see this: every track is legal on its own.
 - `source`: the reference of the part that feeds it (connector, regulator).
 - `sinks`: the parts that draw from it.
 - `amps`: the total current on that path; it is split evenly between the sinks.
+- `minWidthMm` (optional): the trunk is never narrower than this, whatever the
+  current says. Use it where transients matter more than the average current,
+  such as a supply coming in off a car connector.
+
+A protection part between a flow's net and ground (a TVS or ESD diode, any
+two-pin part that is not a capacitor, resistor or inductor) is joined at the
+trunk's width: a transient on the net goes through it. No tap off a trunk is
+wider than the trunk where it joins.
+
+Power that comes onto the board through a connector (a flow whose `source` is
+a connector) is an input trunk. Another power net's via is kept 1 mm clear of
+it wherever there is room elsewhere.
 
 `boards/nano.flows.json` is a full real example. Pass yours with
 `--flows myboard.flows.json`.
@@ -326,12 +340,16 @@ It follows the order a person uses:
    route is kept only if it is better. A connection between two pads on the
    same side that still hops to the other layer to cross another route is
    tried the way a person fixes it: both come up, the hopping one goes back
-   on its own side without vias, and the one it crossed finds another way;
-   kept only if both are routed with fewer vias. Then every route is retried once more
+   on its own side without vias, and the one it crossed (with any taps that
+   hang off it) finds another way; kept only if all of them are routed with
+   fewer vias. These tidying passes ignore the corridor plan: on a finished
+   board the shorter way wins wherever the plan's corridor ran. Then every route is retried once more
    with corners priced high and kept when it has fewer of them and is no
    longer. Finally a via that sits a short stub away from a pad is moved so
    the stub leaves the pad's centre in a straight line, along the pad's long
-   axis when it can. Anything a tidying pass left apart is routed again.
+   axis when it can. Right-angle corners (a square corner, or a V of two
+   diagonals) are cut into two 45-degree bends, as deep into the corner as
+   clearance allows. Anything a tidying pass left apart is routed again.
 9. **Length matching.** The shorter net of each differential pair gets a few
    tall trapezoid bumps on its longest straight runs until the pair is within
    its skew budget. Each bump is checked against the finished board before it
@@ -513,8 +531,8 @@ Numbers are from the reference board, compared with the same board routed by han
   by hand. Most are escape vias next to the pins, two per long bundle member.
   Your hand-routed board keeps more long runs on top. Mid-route hops have come
   down but are still several times the hand-routed count. A short signal that
-  hops a power trunk with taps hanging off it keeps its hop: only routes with
-  nothing attached are moved out of the way.
+  hops a route that cannot move out of its way (a differential pair, or more
+  than ten routes hanging together) keeps its hop.
 - **Differential pairs** are coupled where there is room, and pairs that end
   up apart are re-routed together. On the reference board USB comes out about
   half to two-thirds coupled, like the hand-routed board. The long CAN pair

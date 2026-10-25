@@ -13,11 +13,16 @@ import random
 import re
 from collections import defaultdict
 
-from router import Conn
+from router import Conn, Router
 
 PASSIVE_MAX_PADS = 4
 LONG_MM = 15.0
 SKIP_REFS = ("FID", "H", "TP")
+
+
+def refPrefix(ref):
+    m = re.match(r"[A-Za-z]+", ref)
+    return m.group(0).upper() if m else ""
 
 
 def isAnchor(fp):
@@ -75,10 +80,14 @@ def mstEdges(pads):
     return edges
 
 
-def powerEdges(pads, flows, trunkMinAmps=0.3):
+def powerEdges(pads, flows, trunkMinAmps=0.3, shunts=()):
     """A power net the way a person lays it: a trunk from the source straight to each
     big consumer (largest first, the first trunk out of a source sized for everything
-    that source feeds), then every other pad tapped onto the nearest copper."""
+    that source feeds), then every other pad tapped onto the nearest copper. Edges are
+    (pad, pad, distance, amps, trunk): trunk for the source-to-consumer runs and the links
+    between pins of one part that carries the flow, not for taps. `shunts`:
+    parts that clamp the net to ground (a TVS); their tap is sized like the trunk, since
+    a transient on the net goes through them."""
     edges = []
     inTree = []
     flows = sorted(flows, key=lambda f: -f["amps"])
@@ -97,7 +106,7 @@ def powerEdges(pads, flows, trunkMinAmps=0.3):
             a, b = min(((p, q) for p in src for q in dst), key=lambda pq: octile(pq[0].center, pq[1].center))
             amps = max(share, leaving[f["source"]])
             leaving[f["source"]] -= share
-            edges.append((a, b, octile(a.center, b.center), amps))
+            edges.append((a, b, octile(a.center, b.center), amps, True))
             inTree += [p for p in (a, b) if p not in inTree]
     # small sinks: their share of current, if any, rides on the tap that reaches them
     tapAmps = defaultdict(float)
@@ -106,6 +115,8 @@ def powerEdges(pads, flows, trunkMinAmps=0.3):
         if share < trunkMinAmps:
             for sinkRef in f["sinks"]:
                 tapAmps[sinkRef] += share
+    for ref in shunts:
+        tapAmps[ref] = max([tapAmps[ref]] + [f["amps"] for f in flows])
     # pins of one part that sources or sinks a big flow share that flow between them, so
     # the copper joining them is sized for all of it
     partAmps = defaultdict(float)
@@ -121,7 +132,7 @@ def powerEdges(pads, flows, trunkMinAmps=0.3):
     while rest:
         p, q = min(((p, q) for p in rest for q in inTree), key=lambda pq: octile(pq[0].center, pq[1].center))
         amps = partAmps[p.ref] if p.ref == q.ref else tapAmps.pop(p.ref, 0.0)
-        edges.append((q, p, octile(p.center, q.center), amps))
+        edges.append((q, p, octile(p.center, q.center), amps, p.ref == q.ref and amps > 0))
         inTree.append(p)
         rest.remove(p)
     return edges
@@ -180,8 +191,7 @@ def fanoutWanted(pad, padCount, mode):
         return False
     if mode != "caps-ics":
         raise ValueError(f"fanoutParts must be 'all', 'caps-ics' or 'none', not {mode!r}")
-    m = re.match(r"[A-Za-z]+", pad.ref)
-    prefix = m.group(0).upper() if m else ""
+    prefix = refPrefix(pad.ref)
     if prefix == "C":
         return True
     if prefix in POUR_PREFIXES:
@@ -189,9 +199,29 @@ def fanoutWanted(pad, padCount, mode):
     return padCount > 3
 
 
+# reference prefixes of two-pin parts that do not protect a net when they sit between it
+# and ground (a capacitor decouples, a resistor biases)
+NOT_PROTECTION = {"C", "R", "RN", "L", "FB"}
+
+
+def shuntParts(model, planeNets):
+    """{net: refs of two-pin parts between it and a plane net (GND) that protect it}:
+    TVS and ESD diodes, the parts a transient on the net runs through."""
+    out = defaultdict(set)
+    for fp in model.footprints.values():
+        nets = [p.net for p in fp.pads if p.net]
+        if len(nets) != 2 or refPrefix(fp.ref) in NOT_PROTECTION:
+            continue
+        a, b = nets
+        if (a in planeNets) != (b in planeNets):
+            out[b if a in planeNets else a].add(fp.ref)
+    return out
+
+
 def plan(model, router, log=print, flows=()):
     planeNets = router.planeNets
     block = buildBlocks(model, planeNets)
+    shunts = shuntParts(model, planeNets)
     conns = []
     cid = 0
 
@@ -208,7 +238,8 @@ def plan(model, router, log=print, flows=()):
         cls = model.netClass.get(net, "Default")
         kind = "rf" if cls == "RF50" else ("pwr" if router.powerClass(net) else "sig")
         netFlows = [f for f in flows if f["net"] == net]
-        edges = powerEdges(pads, netFlows) if netFlows else [(a, b, d, 0.0) for a, b, d in mstEdges(pads)]
+        edges = powerEdges(pads, netFlows, shunts=shunts[net]) if netFlows else \
+            [(a, b, d, 0.0, True) for a, b, d in mstEdges(pads)]
         if net in planeNets:
             # pads over the plane each get a fanout via; pads it does not reach (a plane
             # that covers part of the board) are wired to the nearest pad of the net
@@ -221,11 +252,15 @@ def plan(model, router, log=print, flows=()):
                     c.deferred = net in router.outerPourNets and not fanoutWanted(
                         p, len(router.padsOfRef.get(p.ref, ())), router.k.fanoutParts)
             edges = [e for e in edges if e[0].pid not in over or e[1].pid not in over]
-        for a, b, d, amps in edges:
+        # power that comes into the board through a connector
+        inputNet = any(refPrefix(f["source"]) in Router.CONNECTOR_PREFIXES for f in netFlows)
+        for a, b, d, amps, trunk in edges:
             ba, bb = block[a.ref], block[b.ref]
             c = add(net=net, a=a, b=b, kind=kind, block=ba if ba == bb else "")
             c.order = d
             c.amps = amps
+            c.trunk = trunk
+            c.input = inputNet and trunk
             if kind == "rf":
                 c.strict = a.side == b.side or not (a.smd and b.smd)
                 c.prefLayer = a.side if a.smd else b.side

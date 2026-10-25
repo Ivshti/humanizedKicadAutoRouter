@@ -6,6 +6,7 @@ real geometry (tracks + vias), is pulled tight, and is verified exactly before i
 committed. Negotiation mode lets a search cross other routes at a price and rips the
 routes it crossed; they go back on the queue.
 """
+import contextlib
 import copy
 import ctypes
 import math
@@ -155,6 +156,8 @@ class Conn:
     escapes: object = None    # a pair's reserved escapes (see reserveEscapes)
     deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
     layerLock: int = -1       # the only layer this connection may use (-1: any)
+    trunk: bool = True        # power: a source-to-consumer run (False: a tap off one)
+    input: bool = False       # power coming in off a connector (a flow's source is one)
     viaGapMm: float = -1.0    # a fanout's via-to-pad gap when not fanoutViaGapMm (-1)
     thin: bool = False        # a plane fanout that did not fit at its pad's width: signal width
 
@@ -198,6 +201,8 @@ class Router:
         self.children = {}
         self.netItems = {}
         self.flowNets = set()      # power nets whose current is planned from flows
+        self.flowFloor = {}        # net: the narrowest its current-carrying copper may be (flows)
+        self.inputNets = set()     # power nets that come in off a connector (flows)
         self.hist = np.zeros((NLAYERS, self.sp.H, self.sp.W), np.float32)
         self.stats = {"searches": 0, "searchS": 0.0, "costS": 0.0, "commitS": 0.0}
         self.corridors = None      # Corridors planner, once the bundle phase starts
@@ -281,7 +286,7 @@ class Router:
                                base.viaDrill, base.cls)
             return base
         need = ipcWidth(conn.amps, self.k)
-        width = max(base.width, need)
+        width = max(base.width, need, self.flowFloor.get(conn.net, 0.0))
         pads = [p for p in (conn.a, conn.b) if p is not None]
         padMin = min(padMinDim(p) for p in pads)
         narrow = min(width, max(base.narrow, padMin))
@@ -615,6 +620,12 @@ class Router:
             want = (padDist < k.escapeViaMm) | self.corridors.fine(conn.corridorVia, None, win)
         if want is not None:
             viaok[(viaok == 1) & ~want] = 2
+        if conn.kind == "pwr":
+            # another power net's via does not belong beside an input trunk: it costs there
+            # what a via costs out of place
+            near = self.inputDist(nid, win)
+            if near is not None:
+                viaok[(viaok == 1) & (near < rule.viaDia / 2 + self.INPUT_VIA_GAP_MM)] = 2
         for (p, r) in getattr(self, "forbidVias", ()):
             ys, xs = sp.cellCenters(win)
             viaok[(xs - p[0]) ** 2 + (ys - p[1]) ** 2 < r * r] = 0
@@ -1402,6 +1413,43 @@ class Router:
         old.conn.routed = True
         old.conn.rid = old.rid
 
+    INPUT_VIA_GAP_MM = 1.0   # bare board between an input trunk and another power net's via
+
+    def inputDist(self, nid, win, reach=2.0):
+        """Distance (mm) from each cell of win to the nearest copper of an input power net
+        other than nid, or None when there is none within reach."""
+        ids = [self.netId[n] for n in self.inputNets if self.netId[n] != nid]
+        if not ids:
+            return None
+        sp = self.sp
+        i0, j0, i1, j1 = win
+        r = int(math.ceil(reach / sp.g))
+        I0, J0, I1, J1 = max(i0 - r, 0), max(j0 - r, 0), min(i1 + r, sp.H), min(j1 + r, sp.W)
+        near = np.isin(sp.occ[:, I0:I1, J0:J1], ids).any(axis=0)
+        if not near.any():
+            return None
+        return (edt(~near) * sp.g)[i0 - I0:i1 - I0, j0 - J0:j1 - J0]
+
+    def besideInput(self, nid, p, viaDia):
+        """Whether a via of net nid at p would sit within INPUT_VIA_GAP_MM of an input trunk."""
+        i, j = self.sp.toCell(*p)
+        win = (max(i - 1, 0), max(j - 1, 0), min(i + 2, self.sp.H), min(j + 2, self.sp.W))
+        d = self.inputDist(nid, win)
+        return d is not None and float(d.min()) < viaDia / 2 + self.INPUT_VIA_GAP_MM
+
+    @contextlib.contextmanager
+    def unplanned(self, conns):
+        """Route these connections free of their bundle's corridor plan: tidying a finished
+        board, a person takes the shorter way wherever the plan's corridor ran."""
+        saved = [(c, c.corridor, c.corridorVia) for c in conns]
+        for c in conns:
+            c.corridor = c.corridorVia = None
+        try:
+            yield
+        finally:
+            for c, corridor, via in saved:
+                c.corridor, c.corridorVia = corridor, via
+
     def improve(self, rid, layers, winPads, viaMm, straighten=False):
         """Rip a leaf route and search again with everything else in place; keep the new one
         only if it is shorter or uses fewer vias. `straighten`: search with bends priced
@@ -1417,7 +1465,8 @@ class Router:
         if straighten:
             self.k.turn45Mm = turn * self.k.straightenMult
         try:
-            st, new = self.route(r.conn, layers, winPads, viaMm=viaMm)
+            with self.unplanned([r.conn]):
+                st, new = self.route(r.conn, layers, winPads, viaMm=viaMm)
         finally:
             self.k.turn45Mm = turn
         if st == "ok" and new is not None:
@@ -1456,18 +1505,33 @@ class Router:
                     blockers.add(o.route)
         return home, blockers
 
-    def unhop(self, rid, layersOf, winPadsOf, viaMmOf, maxBlockers=2):
+    def subtree(self, rids):
+        """These routes and every route hanging off them, parents before children."""
+        out, seen = [], set()
+        todo = list(rids)
+        while todo:
+            g = todo.pop(0)
+            if g in seen or g not in self.routes:
+                continue
+            seen.add(g)
+            out.append(g)
+            todo += sorted(self.children.get(g, ()))
+        return out
+
+    def unhop(self, rid, layersOf, winPadsOf, viaMmOf, maxBlockers=2, maxRoutes=10):
         """A person does not hop a signal over a track with two vias when the track can make
-        room: rip the hopping route and the routes it hops, lay the hopping one on its own
-        side with no via, then the others again; kept only if every one of them is routed,
-        with fewer vias and less length (vias priced viaCleanupMult times higher)."""
+        room: rip the hopping route and the routes it hops (with the taps hanging off them),
+        lay the hopping one on its own side with no via, then the others again; kept only if
+        everything is joined again, with fewer vias and less length (vias priced
+        viaCleanupMult times higher). Otherwise all of it is put back as it was."""
         found = self.hopBlockers(rid)
         if not found:
             return False
         home, blockers = found
-        group = [rid] + sorted(blockers)
-        if not blockers or len(blockers) > maxBlockers or any(
-                self.children.get(g) or self.routes[g].paired for g in group):
+        if not blockers or len(blockers) > maxBlockers:
+            return False
+        group = self.subtree([rid] + sorted(blockers))
+        if len(group) > maxRoutes or any(self.routes[g].paired for g in group):
             return False
         price = self.k.viaMm * self.k.viaCleanupMult
 
@@ -1486,17 +1550,20 @@ class Router:
             self.rip(g)
         new = []
         ok = True
-        for r, layers in zip(old, [[home]] + [layersOf(r.conn) for r in old[1:]]):
-            st, nr = self.route(r.conn, layers, winPadsOf(r.conn), viaMm=viaMmOf(r.conn))
-            if st != "ok" or nr is None:
+        for k, r in enumerate(old):
+            layers = [home] if k == 0 else layersOf(r.conn)
+            with self.unplanned([r.conn]):
+                st, nr = self.route(r.conn, layers, winPadsOf(r.conn), viaMm=viaMmOf(r.conn))
+            if st != "ok" or (nr is None and (k == 0 or not self.connected(r.conn))):
                 ok = False
                 break
-            new.append(nr.rid)
+            if nr is not None:
+                new.append(nr.rid)
         if ok:
             after, viasAfter = cost(new)
             if viasAfter < viasBefore and after < before:
                 return True
-        for g in new:
+        for g in reversed(new):
             self.rip(g)
         for r in old:
             self.restore(r)
@@ -1724,7 +1791,8 @@ class Router:
                         hl = math.hypot(*h)
                         for d in dists:
                             nv = (ctr[0] + h[0] / hl * d, ctr[1] + h[1] / hl * d)
-                            if math.dist(nv, v) < 1e-4:
+                            if math.dist(nv, v) < 1e-4 or (c.kind == "pwr" and self.besideInput(
+                                    self.netId[c.net], nv, rule.viaDia)):
                                 continue
                             new = [self.viaItem(c.net, nv, rule, rid),
                                    self.trackItem(c.net, layer, ctr, nv, chain[0].width, rule.clearance, rid)]
@@ -2852,7 +2920,7 @@ class Router:
             runs = self.runsOf(r)
             if not runs:
                 continue
-            cap = self.joinedWidth(r) if r.conn.amps <= 0 else max(widths)
+            cap = max(widths) if r.conn.trunk else self.joinedWidth(r)
             fits = []
             for run in runs:
                 now = max(self.sp.items[r.items[i]].width for i in run)
@@ -2870,6 +2938,123 @@ class Router:
                     grown += 1
             self.swapTracks(r, new)
         return grown
+
+    SHORT_FLAT_MM = 0.4   # a flat this short between two bends reads as part of one corner
+
+    def chamferCorners(self):
+        """Right-angle corners cut the way a person draws them, with two 45-degree bends: a
+        square corner gets a diagonal across it, and a V of two diagonals (or two diagonals
+        with a stub of a flat between them) gets a straight across its point, as deep into
+        the corner as clearance allows. Corners on pads, vias or where other copper of the
+        net joins are left alone. Returns the number of corners cut."""
+        cut = 0
+        for r in list(self.routes.values()):
+            if r.paired or r.conn.kind not in ("sig", "pwr"):
+                continue
+            while self.cornerToCut(r):
+                cut += 1
+        return cut
+
+    def cornerToCut(self, r):
+        """Find and cut one right-angle corner of route r: True, or None when there is
+        none left that can be cut."""
+        sp = self.sp
+        tracks = [(idx, sp.items[iid]) for idx, iid in enumerate(r.items) if sp.items[iid].kind == "track"]
+        ends = {}
+        for idx, t in tracks:
+            for p in t.pts:
+                ends.setdefault((t.layers[0], p), []).append(idx)
+        skip = r.uncuttable = getattr(r, "uncuttable", set())
+        for (layer, X), idxs in ends.items():
+            if len(idxs) != 2 or (layer, X) in skip or not self.freeJoint(r, layer, X):
+                continue
+            a, b = (sp.items[r.items[i]] for i in idxs)
+            if a.width != b.width:
+                continue
+            A0 = a.pts[0] if a.pts[1] == X else a.pts[1]     # far end of leg a
+            B1 = b.pts[0] if b.pts[1] == X else b.pts[1]
+            legs = [(idxs[0], A0), (idxs[1], B1)]
+            # a stub of a flat between two bends: the corner is the two legs beyond it
+            for k in (0, 1):
+                i, far = legs[k]
+                if math.dist(X, far) < self.SHORT_FLAT_MM:
+                    nxt = [j for j in ends.get((layer, far), []) if j != i]
+                    if len(nxt) == 1 and self.freeJoint(r, layer, far):
+                        c = sp.items[r.items[nxt[0]]]
+                        if c.width == a.width:
+                            legs[k] = (i, far, nxt[0], c.pts[0] if c.pts[1] == far else c.pts[1])
+            P = legs[0][-1]
+            Q = legs[1][-1]
+            pA = legs[0][1] if len(legs[0]) == 4 else X       # where leg A's line ends
+            pB = legs[1][1] if len(legs[1]) == 4 else X
+            u = self.unit(P, pA)
+            v = self.unit(pB, Q)
+            if abs(u[0] * v[0] + u[1] * v[1]) > 1e-6:          # not a right angle
+                continue
+            apex = self.lineMeet(P, u, Q, v)
+            if apex is None:
+                continue
+            dmax = min(math.dist(P, apex), math.dist(apex, Q))
+            if dmax < 2 * a.width:
+                skip.add((layer, X))
+                continue
+            used = {legs[0][0], legs[1][0]} | {leg[2] for leg in legs if len(leg) == 4}
+            done = False
+            for f in (1.0, 0.75, 0.5, 0.35, 0.25):
+                d = dmax * f
+                if d < 2 * a.width:
+                    break
+                c1 = (round(apex[0] - u[0] * d, 4), round(apex[1] - u[1] * d, 4))
+                c2 = (round(apex[0] + v[0] * d, 4), round(apex[1] + v[1] * d, 4))
+                pts = [P, c1, c2, Q]
+                pts = [q for k, q in enumerate(pts) if k == 0 or math.dist(q, pts[k - 1]) > 1e-3]
+                made = [self.trackItem(r.conn.net, layer, p, q, a.width, a.clearance, r.rid)
+                        for p, q in zip(pts, pts[1:])]
+                if any(self.check(it, ignore=tuple(r.items[i] for i in used)) for it in made):
+                    continue
+                self.replaceTracks(r, used, made)
+                done = True
+                break
+            if done:
+                return True
+            skip.add((layer, X))
+        return None
+
+    def freeJoint(self, r, layer, p):
+        """A bend of route r that is not on a pad or via and where no other copper of its
+        net joins."""
+        nid = self.netId[r.conn.net]
+        mine = set(r.items)
+        for it in self.sp.query([layer], (p[0], p[1], p[0], p[1])):
+            if it.net != nid or (it.iid in mine and it.kind == "track"):
+                continue
+            if it.geom.distance(Point(p)) <= 1e-3:
+                return False
+        return True
+
+    @staticmethod
+    def lineMeet(P, u, Q, v):
+        """Where the line from P along u meets the line through Q along v."""
+        det = u[0] * (-v[1]) - u[1] * (-v[0])
+        if abs(det) < 1e-9:
+            return None
+        t = ((Q[0] - P[0]) * (-v[1]) - (Q[1] - P[1]) * (-v[0])) / det
+        return (P[0] + u[0] * t, P[1] + u[1] * t)
+
+    def replaceTracks(self, r, used, made):
+        """Swap the tracks at these indices of r.items for new ones."""
+        sp = self.sp
+        keep = [iid for i, iid in enumerate(r.items) if i not in used]
+        for i in used:
+            iid = r.items[i]
+            net = sp.items[iid].net
+            sp.remove(iid)
+            self.netItems[net].discard(iid)
+        for it in made:
+            sp.add(it)
+            self.netItems[it.net].add(it.iid)
+            keep.append(it.iid)
+        r.items = keep
 
     def runsOf(self, r):
         """A route's tracks as runs: indices into r.items, one list per stretch of joined
@@ -2893,10 +3078,18 @@ class Router:
         return list(runs.values())
 
     def joinedWidth(self, r):
-        """The widest track of the net, not this route's, that this route's tracks touch
-        (a tap's trunk); unlimited when it touches none (pad to pad)."""
+        """The widest track of the net, not this route's, that this route's tracks or end
+        pads touch (a tap's trunk); unlimited when there is none."""
         mine = set(r.items)
         best = 0.0
+        for pad in (r.conn.a, r.conn.b):
+            if pad is None or not hasattr(pad, "poly"):
+                continue
+            for l in pad.layers:
+                for it in self.sp.query([l], pad.poly.bounds):
+                    if it.kind == "track" and it.net == self.netId[r.conn.net] and it.iid not in mine \
+                            and it.geom.intersects(pad.poly):
+                        best = max(best, it.width)
         for iid in r.items:
             t = self.sp.items[iid]
             if t.kind != "track":

@@ -617,6 +617,7 @@ def cleanup(router, log, deadline=None, rounds=2):
     log(f"straighten: {fixed} routes, {before} -> {after} corners")
     audit(router, log, "straighten")
     log(f"via tidying: {router.tidyVias()} vias moved in line with their pads")
+    log(f"corners: {router.chamferCorners()} right angles cut into two 45-degree bends")
     audit(router, log, "via tidying")
     # differential pairs that ended up apart: route both nets again, together
     pairs = {id(r.conn): r.conn for r in router.routes.values() if r.conn.pairLeader is not None}
@@ -765,8 +766,12 @@ def main():
         with open(args.flows) as f:
             flows = json.load(f)["flows"]
     router.flowNets = {f["net"] for f in flows}
+    for f in flows:
+        if "minWidthMm" in f:
+            router.flowFloor[f["net"]] = max(router.flowFloor.get(f["net"], 0.0), float(f["minWidthMm"]))
     conns, block, bundles = plan(model, router, log, flows)
     router.allConns = conns
+    router.inputNets = {c.net for c in conns if c.input}
     total = len(conns)
     if args.route == "blocks":
         conns = [c for c in conns if c.kind == "gnd" or not c.bundle]
@@ -895,7 +900,8 @@ def main():
     viol = Counter(v["type"] for v in drc["violations"])
     log(f"DRC: {sum(viol.values())} violations {dict(viol)}, {len(drc['unconnected_items'])} unconnected")
     if flows:
-        want = lambda net, amps: max(router.rules[net].width, ipcWidth(amps, router.k))
+        want = lambda net, amps: max(router.rules[net].width, ipcWidth(amps, router.k),
+                                     router.flowFloor.get(net, 0.0))
         bad = squeezes(board, flows, want, router.k.neckMm)
         for f, sink, w, thin in bad:
             where = f"{f['net']} {f['source']} -> {sink} ({f['amps']} A, trunk {w:.2f} mm)"
