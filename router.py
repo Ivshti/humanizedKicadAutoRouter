@@ -273,13 +273,15 @@ class Router:
             pw = base.width if self.powerClass(conn.net) else self.k.powerWidth["Rail"]
             w = max(base.narrow, min(pw, padMinDim(conn.a)))
             return NetRule(w, w, base.clearance, base.viaDia, base.viaDrill, base.cls)
+        # the net class's track width is the designer's floor: a current only widens it
+        classWidth = max(self.m.classes[base.cls].width, base.narrow)
         if conn.amps <= 0:
             if conn.net in self.flowNets:  # a tap on a planned power net carries nothing
-                return NetRule(base.narrow, base.narrow, base.clearance, base.viaDia,
+                return NetRule(classWidth, base.narrow, base.clearance, base.viaDia,
                                base.viaDrill, base.cls)
             return base
         need = ipcWidth(conn.amps, self.k)
-        width = max(base.width if conn.kind != "pwr" else base.narrow, need)
+        width = max(base.width if conn.kind != "pwr" else classWidth, need)
         pads = [p for p in (conn.a, conn.b) if p is not None]
         padMin = min(padMinDim(p) for p in pads)
         narrow = min(width, max(base.narrow, padMin))
@@ -541,9 +543,12 @@ class Router:
                 ok = okFix
                 wideOk[li] = dFix >= rW
             ok &= ~sp.trackKeep[l, i0:i1, j0:j1]
+            front = np.zeros((h, w), bool)
             for fl, cells in self.frontsIn(win):
                 if fl == l:
-                    ok &= ~cells
+                    front |= cells
+            if front.any():   # a keep-out: the track's edge, not its centre, stays out
+                ok &= edt(front) * g >= rule.width / 2 + m
             if not plane:
                 ok &= ~(self.bodyKeep[l, i0:i1, j0:j1] & ~escape)
                 if k.thermalHard:
@@ -588,8 +593,11 @@ class Router:
         dAny = self.clearDist(nid, None, win, rule.clearance, fixedOnly=negotiate, nets=nets)
         viaok = dAny >= rv + rule.clearance + m
         viaok &= ~sp.viaKeep[i0:i1, j0:j1]
+        front = np.zeros((h, w), bool)
         for _, cells in self.frontsIn(win):
-            viaok &= ~cells
+            front |= cells
+        if front.any():
+            viaok &= edt(front) * g >= rv + m
         if not plane:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
         # one cell of raster slack: a pad corner can rasterise one cell short
@@ -1712,6 +1720,7 @@ class Router:
 
     SLOT_MM = 0.8   # how far a slotted pair end runs straight out from its pads
     ESCAPE_PAST_MM = 0.15   # how far past a ball grid's courtyard a pair's escape runs
+    ROW_RUN_MM = 4.0        # how far a pair leaving a row of pins runs on straight past them
 
     def gridArray(self, ref):
         """(pitch, (minx, miny, maxx, maxy)) when the pads of `ref` sit on a square grid of
@@ -1750,13 +1759,16 @@ class Router:
         fp = self.m.footprints[padL.ref]
         away = 1 if (padL.center[0] - fp.pos[0]) * ax[0] + (padL.center[1] - fp.pos[1]) * ax[1] >= 0 else -1
         minx, miny, maxx, maxy = padL.poly.bounds
-        reach = max(maxx - minx, maxy - miny) / 2 + self.ESCAPE_PAST_MM
+        # out past the pads' ends and on in a straight run where the pair has room to
+        # meander if it has to make up length (a BGA escape at its other end leaves its
+        # inner ball's net longer)
+        reach = max(maxx - minx, maxy - miny) / 2 + self.ESCAPE_PAST_MM + self.ROW_RUN_MM
         layer = padL.layers[0]
         for sgn in (away, -away):
             u = (ax[0] * sgn, ax[1] * sgn)
             paths = {p.net: [p.center, (p.center[0] + u[0] * reach, p.center[1] + u[1] * reach)]
                      for p in (padL, padF)}
-            items = {n: [self.trackItem(n, layer, a, b, rule.width, rule.clearance, 0) for a, b in zip(q, q[1:])]
+            items = {n: [self.escapeItem(n, layer, a, b, rule) for a, b in zip(q, q[1:])]
                      for n, q in paths.items()}
             if any(self.check(it) for its in items.values() for it in its) \
                     or not self.pairClear(items[padL.net], items[padF.net]):
@@ -1798,33 +1810,94 @@ class Router:
             # and the room just past them, where the pair has to start: no other net plans
             # through it until the pair has been tried
             rule = self.ruleForConn(c)
-            half = rule.width + self.m.classes[rule.cls].pairGap / 2 + rule.clearance
+            gap = self.m.classes[rule.cls].pairGap
+            half = rule.width + gap / 2 + rule.clearance
+            # long enough for the stretch without vias and then the pair's two vias, so the
+            # pair can change layer in its own room to cross a pair laid before it
+            hv = (rule.viaDia + max(rule.clearance, gap)) / 2
             zones = []
             for e in esc:
                 (mx, my), (ux, uy) = e["mid"], e["u"]
-                L = self.SLOT_MM + 0.4
+                L = self.SLOT_MM + 2 * (hv + rule.viaDia)
                 poly = Polygon([(mx - uy * half, my + ux * half), (mx + uy * half, my - ux * half),
                                 (mx + uy * half + ux * L, my - ux * half + uy * L),
                                 (mx - uy * half + ux * L, my + ux * half + uy * L)])
                 win, mask = self.sp.rasterMask(poly)
                 if mask.size:
-                    zones.append((win, mask, e["layer"]))
+                    # on both outer layers (a crossing pair must not run under it either),
+                    # and for the exact checks too (a pulled-tight shortcut must not cut in)
+                    ko = Item(0, HARD, "keepout", (F, B), poly, 0.0, noTracks=True, noVias=True)
+                    ko.iid = self.sp.nextId
+                    self.sp.nextId += 1
+                    self.sp.items[ko.iid] = ko
+                    self.sp.index(ko, True)
+                    zones += [(win, mask, F, ko), (win, mask, B, None)]
             if zones:
                 self.fronts[id(c)] = zones
         if n:
             log(f"escape stage: {n} pair ends fanned out of their pins before the pairs")
 
+    def escapeOrder(self, conns):
+        """The escaped pairs in the order a person lays a bus: the pairs that leave one side
+        of a part together turn towards where they are going, and the one on the inside of
+        that turn goes first, each next one outside it (a pair laid out of order cuts across
+        the way out of the ones beside it). Pairs that escape a BGA are grouped by it."""
+        groups = {}
+        for c in conns:
+            if not c.escapes or c.pairLeader is not None:
+                continue
+            e = next((e for e in c.escapes if self.gridArray(self.padAt(e).ref) is not None), c.escapes[0])
+            groups.setdefault((self.padAt(e).ref, e["u"]), []).append((c, e))
+        order = []
+        for (ref, u), members in sorted(groups.items(), key=lambda kv: str(kv[0])):
+            # which way the group turns: towards the far ends, across the way out
+            n = (-u[1], u[0])
+            far = [self.farEnd(c, e) for c, e in members]
+            turn = sum((f[0] - e["mid"][0]) * n[0] + (f[1] - e["mid"][1]) * n[1] for f, (c, e) in zip(far, members))
+            sgn = 1 if turn >= 0 else -1
+            members.sort(key=lambda ce: -sgn * (ce[1]["mid"][0] * n[0] + ce[1]["mid"][1] * n[1]))
+            order += [c for c, _ in members]
+        return order
+
+    def padAt(self, e):
+        """The pad an escape starts from."""
+        start = next(iter(e["paths"].values()))[0]
+        return min(self.m.pads, key=lambda p: math.dist(p.center, start))
+
+    def farEnd(self, c, e):
+        """Where a pair goes from an escape: the other end's escape, or its pads' middle."""
+        other = [x for x in c.escapes if x is not e]
+        if other:
+            return other[0]["mid"]
+        pads = [p for p in (c.a, c.b) if p is not None and math.dist(p.center, next(iter(e["paths"].values()))[0]) > 1e-6]
+        return pads[0].center if pads else e["mid"]
+
+    def dropFronts(self, key=None):
+        """Release the room kept in front of one pair's escapes (key: id of its lead), or of
+        every pair's."""
+        for k in ([key] if key is not None else list(self.fronts)):
+            for *_, ko in self.fronts.pop(k, ()):
+                if ko is not None:
+                    self.sp.index(ko, False)
+                    self.sp.items.pop(ko.iid, None)
+
     def frontsIn(self, win):
         """(layer, cells) in `win` reserved in front of pairs' escapes (see reserveEscapes)."""
         i0, j0, i1, j1 = win
         for zones in self.fronts.values():
-            for (a0, b0, a1, b1), mask, layer in zones:
+            for (a0, b0, a1, b1), mask, layer, _ in zones:
                 c0, d0, c1, d1 = max(a0, i0), max(b0, j0), min(a1, i1), min(b1, j1)
                 if c1 <= c0 or d1 <= d0:
                     continue
                 cells = np.zeros((i1 - i0, j1 - j0), bool)
                 cells[c0 - i0:c1 - i0, d0 - j0:d1 - j0] = mask[c0 - a0:c1 - a0, d0 - b0:d1 - b0]
                 yield layer, cells
+
+    def escapeItem(self, net, layer, a, b, rule):
+        """A piece of a pair's escape, from the pin outwards."""
+        it = self.trackItem(net, layer, a, b, rule.width, rule.clearance, 0)
+        it.tag = "escape"
+        return it
 
     def gridCourtyards(self):
         """The courtyards of the board's ball grids."""
@@ -1867,7 +1940,7 @@ class Router:
         G = (I[0] + (u[0] + s[0]) * half, I[1] + (u[1] + s[1]) * half)
         paths = {outer.net: [O, (O[0] + u[0] * reach, O[1] + u[1] * reach)],
                  inner.net: [I, G, (O[0] + s[0] * half + u[0] * reach, O[1] + s[1] * half + u[1] * reach)]}
-        items = {n: [self.trackItem(n, layer, a, b, rule.width, rule.clearance, 0) for a, b in zip(p, p[1:])]
+        items = {n: [self.escapeItem(n, layer, a, b, rule) for a, b in zip(p, p[1:])]
                  for n, p in paths.items()}
         hits = [o for its in items.values() for it in its for o in self.check(it)]
         if hits or not self.pairClear(items[outer.net], items[inner.net]):
@@ -2109,7 +2182,7 @@ class Router:
             # at a turn only part of the splay is sideways to the tracks running in and
             # out: splay further, so each via stays clear of the other net's track
             side = min(abs(uin[0] * nb[1] - uin[1] * nb[0]), abs(uout[0] * nb[1] - uout[1] * nb[0]))
-            reachV = max(hv, (rule.viaDia / 2 + w / 2 + rule.clearance - half) / max(side, 0.3))
+            reachV = max(hv, (rule.viaDia / 2 + w / 2 + rule.clearance - half + self.k.grid / 2) / max(side, 0.3))
             for sign in (1, -1):
                 viaPos[(ri, sign)] = (V[0] + nb[0] * sign * reachV, V[1] + nb[1] * sign * reachV)
         plan = []   # per net: (conn, [(layer, points)], via points)
@@ -2324,7 +2397,7 @@ class Router:
         holder = lead if lead.escapes is not None else follow if follow.escapes is not None else None
         reserved = holder is not None
         if holder is not None:
-            self.fronts.pop(id(holder), None)
+            self.dropFronts(id(holder))
         found = holder.escapes if reserved else self.findEscapes(lead, follow)
         if holder is not None:
             holder.escapes = None
@@ -2488,7 +2561,7 @@ class Router:
                    if self.sp.items[i].kind == "track")
 
     @staticmethod
-    def serpentine(p, q, w, side, extra, amax, pitch):
+    def serpentine(p, q, w, side, extra, amax, pitch, amin=None, atEnd=False):
         """The run p->q with trapezoid bumps (45 deg flanks, flat top) to one side that add
         up to `extra` mm of length, at most `amax` high: few and tall, as a person draws
         them. Returns (points, mm added), or None when the run is too short."""
@@ -2501,8 +2574,8 @@ class Router:
         gap = max(0.5 * amax, pitch)            # between bumps
         margin = max(2 * w, 0.3)
         perA = 2 * (math.sqrt(2) - 1)           # mm gained per mm of amplitude
-        amin = max(2 * w, 0.3)
-        if extra < perA * amin or amax < amin:
+        amin = max(2 * w, 0.3) if amin is None else amin
+        if extra < perA * amin or amax < amin - 1e-9:
             return None
         nb = math.ceil(extra / (perA * amax))
         A = min(amax, extra / (nb * perA))
@@ -2512,7 +2585,7 @@ class Router:
         if nb < 1:
             return None
         span = nb * (2 * A + top) + (nb - 1) * gap
-        x = (L - span) / 2
+        x = L - margin - span if atEnd else (L - span) / 2   # atEnd: away from p (a pin)
         at = lambda a, b: (p[0] + u[0] * a + n[0] * b, p[1] + u[1] * a + n[1] * b)
         pts = [p]
         for _ in range(nb):
@@ -2529,9 +2602,26 @@ class Router:
         if r is None:
             return 0.0
         added = 0.0
+        trace = os.environ.get("HR_TRACE_PAIR")
+        for _ in range(3):   # a bumped run leaves straight pieces either side: look again
+            before = added
+            added = self.lengthenPass(conn, r, extra, added, amax, trace)
+            if added - before < 0.01 or extra - added < 0.05:
+                break
+        return added
+
+    def lengthenPass(self, conn, r, extra, added, amax, trace):
+        """One pass of lengthen over the route's runs as they are now."""
+        # the pins' ways out first: a person keeps the run of a bus straight and makes up
+        # length where the pair leaves its pins
         tracks = sorted((self.sp.items[i] for i in r.items if self.sp.items[i].kind == "track"),
-                        key=lambda it: -math.dist(*it.pts))
+                        key=lambda it: (it.tag != "escape", -math.dist(*it.pts)))
+        mate = conn.pairMate
+        mateRoute = self.routes.get(mate.rid) if mate is not None else None
+        partner = [self.sp.items[i] for i in mateRoute.items if self.sp.items[i].kind == "track"] if mateRoute else []
         for it in tracks:
+            if partner and self.alongside(it, partner):
+                continue   # a bump here would break the pair's coupling (and step the bus)
             want = extra - added
             if want < 0.05:
                 break
@@ -2539,18 +2629,49 @@ class Router:
                 continue   # another route joins this piece: bending it would leave that one hanging
             if any(c.intersects(it.geom) for c in self.gridCourtyards()):
                 continue   # under a BGA there is room for one track between balls, not for bumps
+            if trace:
+                self.log(f"lengthen {conn.net}: {math.dist(*it.pts):.2f} mm run {it.pts}")
             pitch = max(3 * it.width, it.width + it.clearance)
+            # small bumps last: a fine pair in a tight bus has room for little else
+            small = max(2 * it.width, it.width + 2 * it.clearance)
+            p0, q0 = it.pts
+            if it.tag == "escape":
+                # a pin's way out: bumps only past the pins' ends, where the pins beside it
+                # are no longer in the way
+                pad = self.padUnder(conn.net, it.layers[0], p0)
+                if pad is not None:
+                    minx, miny, maxx, maxy = pad.poly.bounds
+                    u = self.unit(p0, q0)
+                    skip = abs(u[0]) * (maxx - minx) / 2 + abs(u[1]) * (maxy - miny) / 2 + 2 * it.clearance
+                    if skip >= math.dist(p0, q0):
+                        continue
+                    p0 = (p0[0] + u[0] * skip, p0[1] + u[1] * skip)
             done = False
-            for amp in (amax, amax * 0.6, amax * 0.35):
+            amps = {amax, amax * 0.6, 0.7, amax * 0.35, 0.35, small}
+            if it.tag == "escape":
+                # out of a row of pins: not past the next pair's way out
+                amps = {a for a in amps if a <= 0.9} or {small}
+            for amp in sorted(amps, reverse=True):
                 for side in (1, -1):
-                    res = self.serpentine(*it.pts, it.width, side, want, amp, pitch)
+                    res = self.serpentine(p0, q0, it.width, side, want, amp, pitch, amin=min(small, 0.3),
+                                          atEnd=it.tag == "escape")
                     if res is None:
+                        if trace:
+                            self.log(f"   amp {amp:.2f}: no bumps fit (want {want:.2f} mm)")
                         continue
                     pts, gain = res
+                    if p0 != it.pts[0]:
+                        pts = [it.pts[0]] + pts
                     layer = it.layers[0]
                     new = [self.trackItem(conn.net, layer, a, b, it.width, it.clearance, r.rid)
                            for a, b in zip(pts, pts[1:]) if a != b]
-                    if any(self.check(t, ignore={it.iid}) or self.underBody(t, layer) for t in new):
+                    bad = [o for t in new for o in self.check(t, ignore={it.iid})]
+                    # only what the bumps add: the run itself was allowed where it is
+                    under = [t.pts for t in new if not t.geom.within(it.geom.buffer(1e-6)) and self.underBody(t, layer)]
+                    if bad or under:
+                        if trace:
+                            self.log(f"   amp {amp:.2f} side {side}: hits {[(o.kind, self.netName.get(o.net, o.net)) for o in bad][:3]}"
+                                     f"{'; under a body at ' + str(under[:2]) if under else ''}")
                         continue
                     self.sp.remove(it.iid)
                     self.netItems[it.net].discard(it.iid)
@@ -2565,6 +2686,18 @@ class Router:
                 if done:
                     break
         return added
+
+    def alongside(self, it, partner):
+        """Whether track `it` runs beside its pair partner for most of its length (within
+        the pair's spacing on the same layer)."""
+        rule = self.rules[self.netName[it.net]]
+        reach = it.width + self.m.classes[rule.cls].pairGap + 0.05
+        seg = LineString(it.pts)
+        n = max(2, int(seg.length / 0.1) + 1)
+        near = sum(1 for i in range(n)
+                   if any(t.layers == it.layers and LineString(t.pts).distance(seg.interpolate(i / (n - 1), normalized=True)) <= reach
+                          for t in partner))
+        return near >= 0.5 * n
 
     def joinedByOthers(self, it, r):
         """Whether copper of the same net that is not route r's touches track piece it."""

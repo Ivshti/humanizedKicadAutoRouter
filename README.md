@@ -217,7 +217,11 @@ check the following.
       straight out of their pins, away from the part's body, before closing up.
     From there the pair runs straight on for a short stretch with no via, then
     goes its way as a pair. The escapes are part of the pair's own routing, so
-    they count towards its length when it is matched.
+    they count towards its length when it is matched. Escaped pairs are laid
+    before anything else, the way a person lays a bus: those that leave one side
+    of a part together go in order from the inside of their turn outwards, and
+    the room just past each escape is kept free until its own pair goes down,
+    with space for the pair to change layer there to cross a pair laid before it.
 
 Any existing tracks, vias and outer-layer copper pours are removed before
 routing. The router always starts from a clean board, plus your inner planes.
@@ -228,8 +232,10 @@ routing. The router always starts from a clean board, plus your inner planes.
 
 Without a flows file, power nets are routed at their net-class width. With one,
 each power net is laid out as a person would. A trunk runs from the source to
-each big consumer, sized by IPC-2221 for the current it actually carries. Small
-loads are tapped off it, and tracks neck down only at the pins.
+each big consumer, sized by IPC-2221 for the current it actually carries, and
+never narrower than the net class's track width (a small current only ever
+widens a track). Small loads are tapped off it at the class width, and tracks
+neck down only at the pins.
 
 ```json
 {

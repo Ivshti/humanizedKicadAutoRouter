@@ -122,6 +122,10 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     first = [c for c in order if not (c.bundle and c.kind == "sig")]
     later = [c for c in order if c.bundle and c.kind == "sig"]
     router.reserveEscapes(order, log)
+    # the pairs that escaped go first, as a person lays a bus out of a BGA or connector:
+    # inside of the turn first; one that cannot be laid is routed net by net in its place
+    for c in router.escapeOrder(order):
+        router.routePair(c, c.pairMate, layersFor(c), winPadsFor(c), viaMmFor(c, k))
     relaxed = 0
     for c in first:
         st, _ = router.route(c, layersFor(c), winPadsFor(c), viaMm=viaMmFor(c, k))
@@ -139,6 +143,7 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
         st, _ = router.route(c, layersFor(c), winPadsFor(c), viaMm=viaMmFor(c, k))
         if st != "ok":
             failed.append(c)
+    router.dropFronts()   # every pair has been tried: the room in front of escapes is free
     log(f"pass 1: {len(order) - len(failed)}/{len(order)} routed in {time.perf_counter() - t0:.1f}s, "
         f"{len(failed)} failed: {Counter(c.kind for c in failed)}; {deferred} GND pads left to the pour"
         + (f"; {relaxed} block connections had to leave their parts' layer" if relaxed else ""))
