@@ -57,14 +57,15 @@ CELL_N_SENSE alone makes five hops on one net.
 
 ## Addendum: the boost's feedback cluster (owner: "excuse me?")
 
-R_FB1 pin 1 at about (36.4, 72.5) and C_BOOST pin 1 at about (36.1, 68.1) are both
-V_BOOST pads on F.Cu, 4 mm apart with nothing between them on the front. The router
-joined them with two vias, at (36.12, 69.05) and (36.25, 72.47), and 3.5 mm of B.Cu,
-then put a GND return via in the gap between those two vias. That leaves a sliver of
-pour around it, 0.1–0.2 mm from the pads.
+The V_BOOST via pair at (36.12, 69.05) and (36.25, 72.47), 3.5 mm on B.Cu, is **not** a
+pointless hop. C_BOOST's GND pad and the output-cap row sit between them on the front.
+The owner: "this one makes a little sense since the opposite side runs a spine." The
+defect is what the router put next to it: a GND return via forced into the gap between
+those two vias, leaving a sliver of pour 0.1–0.2 mm from the pads.
 
 - A return via must not be forced into a gap that small.
-- A return via is pointless where the "signal" via is itself a needless hop.
 
 `routeDefects.py` (board repo) now also lists vias within 0.2 mm of a pad (24 new in this
-pass), tracks passing between a two-pad part's pads, and acute V-turns.
+pass), tracks passing between a two-pad part's pads, and acute V-turns. Its "hop" finding
+does not check what blocks the other layer, so some hops it lists are justified, like
+this one.
