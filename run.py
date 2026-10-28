@@ -511,9 +511,15 @@ def cutOffGndPads(board, router, net="GND"):
     nid = router.netId[net]
     anchors = [Point(it.pts[0]) for it in router.sp.items.values() if it.net == nid and it.kind == "via"]
     anchors += [Point(p.center) for p in router.m.nets.get(net, []) if not p.smd]
+    joined = []   # tracks of the net: a piece one runs from is joined through it
     for t in board.GetTracks():   # the board's own vias, and those written since
-        if t.GetClass() == "PCB_VIA" and t.GetNetname() == net:
+        if t.GetNetname() != net:
+            continue
+        if t.GetClass() == "PCB_VIA":
             anchors.append(Point(t.GetPosition().x / 1e6, t.GetPosition().y / 1e6))
+        else:
+            joined.append((t.GetLayer(), LineString([(t.GetStart().x / 1e6, t.GetStart().y / 1e6),
+                                                     (t.GetEnd().x / 1e6, t.GetEnd().y / 1e6)])))
     out = []
     layers = [(F, pcbnew.F_Cu), (B, pcbnew.B_Cu)] + [(l, KICAD_LAYERS[l]) for l in sorted(router.powerLayers)]
     for layer, lid in layers:
@@ -523,7 +529,8 @@ def cutOffGndPads(board, router, net="GND"):
             fill = polySetToShapely(z.GetFilledPolysList(lid))
             for piece in (getattr(fill, "geoms", [fill]) if fill is not None else []):
                 near = piece.buffer(0.3)
-                if any(near.contains(a) for a in anchors):
+                if any(near.contains(a) for a in anchors) or \
+                        any(l == lid and near.intersects(t) for l, t in joined):
                     continue
                 out += [(p, layer, piece) for p in router.m.nets.get(net, [])
                         if p.smd and layer in p.layers and p.poly.distance(piece) < 0.05
