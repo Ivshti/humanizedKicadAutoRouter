@@ -3383,6 +3383,7 @@ class Router:
         return grown
 
     SHORT_FLAT_MM = 0.4   # a flat this short between two bends reads as part of one corner
+    MAX_CUTS = 50         # corners cut per route at most
 
     def chamferCorners(self):
         """Right-angle corners cut the way a person draws them, with two 45-degree bends: a
@@ -3394,7 +3395,9 @@ class Router:
         for r in list(self.routes.values()):
             if r.paired or r.conn.kind not in ("sig", "pwr"):
                 continue
-            while self.cornerToCut(r):
+            for _ in range(self.MAX_CUTS):   # each cut shortens the route, so this ends
+                if not self.cornerToCut(r):
+                    break
                 cut += 1
         return cut
 
@@ -3453,6 +3456,11 @@ class Router:
                 pts = [q for k, q in enumerate(pts) if k == 0 or math.dist(q, pts[k - 1]) > 1e-3]
                 made = [self.trackItem(r.conn.net, layer, p, q, a.width, a.clearance, r.rid)
                         for p, q in zip(pts, pts[1:])]
+                # only a cut that shortens the route: a corner of two legs past a flat can
+                # otherwise come back longer, and be cut again for ever
+                old = sum(math.dist(*self.sp.items[r.items[i]].pts) for i in used)
+                if sum(math.dist(p, q) for p, q in zip(pts, pts[1:])) > old - 1e-3:
+                    continue
                 if any(self.check(it, ignore=tuple(r.items[i] for i in used)) for it in made):
                     continue
                 self.replaceTracks(r, used, made)
