@@ -922,8 +922,11 @@ class Router:
                     return it.pad.ref in ends
                 r = self.routes.get(it.route)
                 return r is not None and r.conn.amps >= conn.amps - 1e-6
-            srcItems = [it for it in srcItems if okLand(it)] or srcItems
-            dstItems = [it for it in dstItems if okLand(it)] or dstItems
+            # nothing of the component qualifies: its own end pad, never a tap (the Ambire
+            # signer's BAT_N ran the cell's current through a 0.15 mm sense tap)
+            srcItems = [it for it in srcItems if okLand(it)] or self.padItems(conn.a)
+            if not toPlane:
+                dstItems = [it for it in dstItems if okLand(it)] or self.padItems(conn.b)
         win = sp.winFor(bounds, winPad)
         t0 = time.perf_counter()
         cost, viaok, wideOk, _ = self.buildCost(conn, rule, win, layers, srcItems, dstItems,
