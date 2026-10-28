@@ -31,7 +31,7 @@ from corridors import Corridors, splitBundles
 from flowcheck import squeezes
 from router import Knobs, Router, ipcWidth
 from strategy import followLeaders, pairPartners, phaseOrder, plan
-from tidy import Judge, tidy
+from tidy import Judge, splitDanglingTees, tidy
 
 
 SIGNAL_LAYERS = [F, B]   # set from the router's stack in main()
@@ -503,6 +503,66 @@ def acrossAntennas(router, conns, unrouted, detour=1.8):
         out.append(f"placement: {c.net} {c.a.ref}.{c.a.num} -> {c.b.ref}.{c.b.num} crosses the antenna "
                    f"{', '.join(hit)} (no via under it, no track on its side): {how}")
     return out
+
+
+def cutOffGndPads(board, router, net="GND"):
+    """SMD pads of the plane net left on a piece of outer pour (or of a plane layer that
+    carries power) with no via and no through-hole pad of the net: [(pad, layer, piece)]."""
+    nid = router.netId[net]
+    anchors = [Point(it.pts[0]) for it in router.sp.items.values() if it.net == nid and it.kind == "via"]
+    anchors += [Point(p.center) for p in router.m.nets.get(net, []) if not p.smd]
+    for t in board.GetTracks():   # the board's own vias, and those written since
+        if t.GetClass() == "PCB_VIA" and t.GetNetname() == net:
+            anchors.append(Point(t.GetPosition().x / 1e6, t.GetPosition().y / 1e6))
+    out = []
+    layers = [(F, pcbnew.F_Cu), (B, pcbnew.B_Cu)] + [(l, KICAD_LAYERS[l]) for l in sorted(router.powerLayers)]
+    for layer, lid in layers:
+        for z in board.Zones():
+            if z.GetNetname() != net or not z.IsOnLayer(lid) or z.GetIsRuleArea():
+                continue
+            fill = polySetToShapely(z.GetFilledPolysList(lid))
+            for piece in (getattr(fill, "geoms", [fill]) if fill is not None else []):
+                near = piece.buffer(0.3)
+                if any(near.contains(a) for a in anchors):
+                    continue
+                out += [(p, layer, piece) for p in router.m.nets.get(net, [])
+                        if p.smd and layer in p.layers and p.poly.distance(piece) < 0.05
+                        and not any(p is q for q, _, _ in out)]
+    return out
+
+
+GUARD_MM = 0.4   # tracks of the routes that walled a pad's pour in keep this far off it
+
+
+def guardPours(board, router, conns, log):
+    """Routes of this run that walled a GND pad's piece of pour off from every via are laid
+    again with their tracks kept GUARD_MM off that piece, so it can join the rest of the
+    pour or take a via. Kept only if every connection they held is joined again; returns
+    how many pads were freed."""
+    freed = 0
+    for pad, layer, piece in cutOffGndPads(board, router):
+        culprits = sorted({o.route for o in router.sp.query([layer], piece.buffer(0.5).bounds)
+                           if o.kind == "track" and o.route in router.routes
+                           and o.geom.distance(piece) < o.clearance + 0.05})
+        if not culprits:
+            continue
+        router.begin()
+        keep = router.keepTracksOut(piece.buffer(GUARD_MM), layer)
+        ripped = []
+        for rid in culprits:
+            router.rip(rid, ripped)
+        negotiate(router, list(ripped), log, maxRounds=10)
+        nets = ", ".join(sorted({c.net for c in ripped}))
+        if all(router.connected(c) for c in ripped):
+            router.commitTxn()
+            freed += 1
+            log(f"pour: {pad.ref}.{pad.num} had its pour walled off; {nets} laid again round it")
+        else:
+            router.rollback()
+            router.commitTxn()
+            router.dropKeep(keep)
+            log(f"pour: {pad.ref}.{pad.num} has its pour walled off and {nets} cannot go round it")
+    return freed
 
 
 def gndMissed(drc):
@@ -977,6 +1037,8 @@ def main():
     log(f"wrote {outBoard}: {nT} tracks, {nV} vias")
     drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
     for _ in range(2):
+        # a route of ours that walled a GND pad's pour off from every via goes round it
+        freed = guardPours(board, router, conns, log) if "GND" in router.planeNets else 0
         # GND pads whose piece of pour ended up cut off: fan them out to the plane after
         # all, pushing other routes aside, and write the board again
         found = strandedGnd(drc, conns)
@@ -1002,14 +1064,14 @@ def main():
             repaired = [c for c in missed if router.connected(c)]
         else:
             repaired, solid = [], 0
-        if not stranded and not repaired and not solid:
+        if not stranded and not repaired and not solid and not freed:
             break
         if stranded:
             negotiate(router, list(stranded), log, maxRounds=10, winPads=(2.0, 6.0, 15.0))
             log(f"stranded GND pads: {sum(1 for c in stranded if router.connected(c))}/{len(stranded)} "
                 f"fanned out to the plane")
             audit(router, log, "stranded GND repair")
-        fixed = sum(1 for c in stranded + repaired if router.connected(c)) + solid
+        fixed = sum(1 for c in stranded + repaired if router.connected(c)) + solid + freed
         if not fixed:
             break
         nT, nV, nIsl, islandPads = finish()
@@ -1033,6 +1095,12 @@ def main():
         scope = {n for n in model.nets if any(fnmatch.fnmatchcase(n, p) for p in pats)} if args.nets else None
         tidy(board, judge, log, report=args.tidy == "report", nets=scope, fixed=designer)
         if args.tidy != "report":
+            board.Save(outBoard)
+            drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
+    if any(v["type"] == "track_dangling" for v in drc["violations"]):
+        n = splitDanglingTees(board)
+        if n:
+            log(f"T-joints: {n} tracks split where KiCad did not join a track ending on them")
             board.Save(outBoard)
             drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
     viol = Counter(v["type"] for v in drc["violations"])

@@ -1838,6 +1838,27 @@ class Router:
         return bad
 
     # ---- copper already on the board ----------------------------------------------------------
+    def keepTracksOut(self, poly, layer):
+        """Keep every track off poly on one layer (as a keep-out zone does); returns what
+        dropKeep() needs to undo it."""
+        sp = self.sp
+        it = Item(0, HARD, "keepout", (layer,), poly, 0.0, noTracks=True)
+        it.iid = sp.nextId
+        sp.nextId += 1
+        sp.items[it.iid] = it
+        sp.index(it, True)
+        win, mask = sp.rasterMask(poly, 0.25 + self.k.margin)
+        i0, j0, i1, j1 = win
+        before = sp.trackKeep[layer, i0:i1, j0:j1].copy()
+        sp.trackKeep[layer, i0:i1, j0:j1] |= mask
+        return it, layer, win, before
+
+    def dropKeep(self, keep):
+        it, layer, (i0, j0, i1, j1), before = keep
+        self.sp.index(it, False)
+        self.sp.items.pop(it.iid, None)
+        self.sp.trackKeep[layer, i0:i1, j0:j1] = before
+
     TOUCH_MM = 0.002   # copper overlapping less than this only touches
 
     def loadExisting(self, tracks, vias, soft=frozenset()):
