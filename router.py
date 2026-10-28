@@ -1838,6 +1838,8 @@ class Router:
         return bad
 
     # ---- copper already on the board ----------------------------------------------------------
+    TOUCH_MM = 0.002   # copper overlapping less than this only touches
+
     def loadExisting(self, tracks, vias, soft=frozenset()):
         """Tracks [(net, layer, p1, p2, width, uuid)] and vias [(net, p, dia, drill, uuid)]
         already on the board, as fixed copper: nothing may cross them, negotiation never
@@ -1883,11 +1885,13 @@ class Router:
                 continue
             # joined the way KiCad joins copper: any overlap on a shared layer, not only a
             # track end inside the other shape (a track whose width covers a pad's edge,
-            # a via whose rim overlaps a track)
+            # a via whose rim overlaps a track). Copper that only touches is not joined;
+            # the shrink also takes off the CIRC margin round shapes are drawn with
+            core = it.geom.buffer(-self.TOUCH_MM)
             for l in it.layers:
                 for o in self.sp.query([l], it.geom.bounds):
                     if o.iid == it.iid or o.net != it.net or l not in o.layers \
-                            or not o.geom.intersects(it.geom):
+                            or not o.geom.intersects(core):
                         continue
                     if o.kind == "pad":
                         parent[find(it.iid)] = find(("pad", o.pad.pid))

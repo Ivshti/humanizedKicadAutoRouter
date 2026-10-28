@@ -4,7 +4,8 @@
 
 1. Net A's two pads are joined by a track that ends 0.05 mm short of the second pad, its
    width covering the pad's edge (KiCad: connected). The router must see the connection
-   as made, not route it again.
+   as made, not route it again. Net C's track runs along its second pad with its edge
+   exactly on the pad's (KiCad: not connected): that connection is still open.
 2. A route is laid, then in a transaction ripped and another laid instead; rollback puts
    the first back exactly and removes the second.
 """
@@ -30,12 +31,13 @@ PRO = {
                                   "via_diameter": 0.6, "via_drill": 0.3, "diff_pair_gap": 0.2}],
                      "netclass_patterns": []},
 }
-PADS = (("PA1", "A", (5, 5)), ("PA2", "A", (10, 5)), ("PB1", "B", (5, 12)), ("PB2", "B", (12, 12)))
+PADS = (("PA1", "A", (5, 5)), ("PA2", "A", (10, 5)), ("PB1", "B", (5, 12)), ("PB2", "B", (12, 12)),
+        ("PC1", "C", (5, 17)), ("PC2", "C", (10, 17)))
 
 
 def build(path):
     b = pcbnew.BOARD()
-    nets = {n: pcbnew.NETINFO_ITEM(b, n) for n in ("A", "B")}
+    nets = {n: pcbnew.NETINFO_ITEM(b, n) for n in ("A", "B", "C")}
     for n in nets.values():
         b.Add(n)
     corners = [(0, 0), (20, 0), (20, 20), (0, 20)]
@@ -69,6 +71,15 @@ def build(path):
     t.SetLayer(pcbnew.F_Cu)
     t.SetNet(nets["A"])
     b.Add(t)
+    # C: from PC1's centre along PC2's top edge, its own edge exactly on the pad's (touching
+    # only: KiCad does not join them)
+    t = pcbnew.PCB_TRACK(b)
+    t.SetStart(v(5, 16.4))
+    t.SetEnd(v(10, 16.4))
+    t.SetWidth(int(0.2 * MM))
+    t.SetLayer(pcbnew.F_Cu)
+    t.SetNet(nets["C"])
+    b.Add(t)
     b.Save(path)
     with open(path.replace(".kicad_pcb", ".kicad_pro"), "w") as f:
         json.dump(PRO, f)
@@ -95,6 +106,8 @@ if __name__ == "__main__":
     pad = {p.ref: p for p in model.pads}
     a = Conn(1, "A", pad["PA1"], pad["PA2"], "sig")
     check(r.connected(a), "a track whose width covers a pad's edge joins it")
+    check(not r.connected(Conn(3, "C", pad["PC1"], pad["PC2"], "sig")),
+          "a track that only touches a pad's edge does not")
 
     b = Conn(2, "B", pad["PB1"], pad["PB2"], "sig")
     st, first = r.route(b, [0])
