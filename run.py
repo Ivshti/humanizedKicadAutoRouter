@@ -545,6 +545,7 @@ def guardPours(board, router, conns, log):
                            if o.kind == "track" and o.route in router.routes and o.net != router.netId[pad.net]
                            and o.geom.distance(piece) < o.clearance + 0.05})
         if not culprits:
+            log(f"pour: {pad.ref}.{pad.num} has its pour walled off by copper this run did not lay")
             continue
         router.begin()
         keep = router.keepTracksOut(piece.buffer(GUARD_MM), layer)
