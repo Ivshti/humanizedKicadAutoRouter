@@ -1,0 +1,14 @@
+(version 1)
+
+# The CSI pairs (sensor to chokes, chokes to HDMI): 0.09 mm tracks 0.09 mm apart make about
+# 100 ohm on JLC's JLC04161H-3313 stack-up (0.0994 mm prepreg to the inner ground).
+# P and N within 0.5 mm of each other: the IMX708 runs its two lanes at up to 900 Mb/s on a
+# Raspberry Pi (450 MHz link clock), a 1.1 ns bit; 0.5 mm of track is about 3 ps of it. Each pair
+# leaves the receptacle from two neighbouring pins 0.4 mm apart in one row, so the first bend away
+# from the row already costs that much. Lane to clock is not matched: every pair is shorter than
+# 25 mm, and the 1-2 m camera cable dwarfs it.
+# The inDiffPair() patterns are what the router reads its matching budget from (the class test is
+# what KiCad applies).
+(rule "CSI pairs: P and N within 0.5 mm"
+  (condition "A.NetClass == 'CSI' || A.inDiffPair('CSI_*') || A.inDiffPair('CON_CSI_*')")
+  (constraint skew (max 0.5mm) (within_diff_pairs)))

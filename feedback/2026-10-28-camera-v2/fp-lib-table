@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "camera")(type "KiCad")(uri "${KIPRJMOD}/camera.pretty")(options "")(descr "GridCore camera board parts (scripts/makeLibrary.py)"))
+)

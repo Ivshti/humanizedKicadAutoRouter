@@ -1,0 +1,12 @@
+{
+  "_comment": "Currents from Raspberry Pi's reference schematic: 1.1 V buck max 600 mA, 1.8 V and 2.8 V LDOs 50 mA each. 3.3 V in = 1.1 V x 0.6 A / ~85 % + 0.1 A.",
+  "flows": [
+    { "net": "V3V3", "source": "J1", "sinks": ["FB1", "FB2"], "amps": 0.4 },
+    { "net": "V3V3_BUCK", "source": "FB2", "sinks": ["U11"], "amps": 0.3 },
+    { "net": "BUCK_LX", "source": "U11", "sinks": ["L1"], "amps": 0.6 },
+    { "net": "V1V1", "source": "L1", "sinks": ["J2"], "amps": 0.6 },
+    { "net": "V3V3_LDO", "source": "FB1", "sinks": ["U1", "U2"], "amps": 0.1 },
+    { "net": "V1V8", "source": "U1", "sinks": ["J2"], "amps": 0.05 },
+    { "net": "V2V8", "source": "U2", "sinks": ["J2"], "amps": 0.05 }
+  ]
+}
