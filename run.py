@@ -22,10 +22,10 @@ import numpy as np
 import pcbnew
 from shapely.geometry import LineString, Point
 
-from boardModel import (B, F, INNER_KICAD, LAYER_BY_NAME, LAYER_NAMES, PHYSICAL, boardPlanes,
-                        existingCopper, fillZones, innerPlaneFills, loadModel, planeLayersOf,
-                        polySetToShapely, readCourtyardClearances, readLayerNets, readSkewRules,
-                        ripCopper)
+from boardModel import (B, F, INNER_KICAD, KICAD_LAYERS, LAYER_BY_NAME, LAYER_NAMES, PHYSICAL,
+                        boardPlanes, existingCopper, fillZones, innerPlaneFills, loadModel,
+                        planeLayersOf, polySetToShapely, readCourtyardClearances, readLayerNets,
+                        readSkewRules, ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from flowcheck import squeezes
@@ -525,7 +525,10 @@ def stitchPours(board, router, conns, net="GND", openPour=True):
     anchors = [it.pts[0] for it in sp.items.values() if it.net == nid and it.kind == "via"]
     anchors += [p.center for p in router.m.nets.get(net, []) if not p.smd]
     pieces = []
-    for layer, lid in ((F, pcbnew.F_Cu), (B, pcbnew.B_Cu)):
+    # the outer pours, and the pour of a plane layer that carries power: its tracks can cut
+    # a piece of the plane loose
+    layers = [(F, pcbnew.F_Cu), (B, pcbnew.B_Cu)] + [(l, KICAD_LAYERS[l]) for l in sorted(router.powerLayers)]
+    for layer, lid in layers:
         for z in board.Zones():
             if z.GetNetname() != net or not z.IsOnLayer(lid) or z.GetIsRuleArea():
                 continue
@@ -552,6 +555,8 @@ def stitchPours(board, router, conns, net="GND", openPour=True):
         return pt
     inPour = np.zeros_like(ok)
     for layer, piece in pieces:
+        if layer not in (F, B):   # the open-pour grid is for the outer pours
+            continue
         room = piece.buffer(-(rv + 0.1))
         if room.is_empty:
             continue
