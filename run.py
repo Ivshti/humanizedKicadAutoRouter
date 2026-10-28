@@ -542,7 +542,7 @@ def guardPours(board, router, conns, log):
     freed = 0
     for pad, layer, piece in cutOffGndPads(board, router):
         culprits = sorted({o.route for o in router.sp.query([layer], piece.buffer(0.5).bounds)
-                           if o.kind == "track" and o.route in router.routes
+                           if o.kind == "track" and o.route in router.routes and o.net != router.netId[pad.net]
                            and o.geom.distance(piece) < o.clearance + 0.05})
         if not culprits:
             continue
