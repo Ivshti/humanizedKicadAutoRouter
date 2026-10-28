@@ -57,7 +57,9 @@ def viaMmFor(c, k):
         # a supply-plane fanout would rather share a via of its net a short walk away
         # than set its own beside it; ground fanouts are cheap (the pour joins them anyway)
         return 0.4 if c.net == "GND" else 1.5
-    if c.amps > 1.0 or c.kind == "pwr":   # a person keeps power paths on one layer
+    # a person keeps power paths on one layer; a tap that carries no current (a flow net's
+    # gate hold or sense pin) is priced like a signal
+    if c.amps > 1.0 or (c.kind == "pwr" and (c.trunk or c.amps > 0)):
         return k.viaMm * 4
     return k.viaMm
 
@@ -170,8 +172,15 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
         f"{len(failed)} failed: {Counter(c.kind for c in failed)}; {deferred} GND pads left to the pour"
         + (f"; {relaxed} block connections had to leave their parts' layer" if relaxed else ""))
     # GND pads the fanout could not reach are left to the outer pour; they are judged by DRC
+    signal = [c for c in conns if not (c.kind == "gnd" and c.net == "GND")]
+    before = sum(1 for c in signal if not router.connected(c))
+    router.begin()
     rounds = negotiate(router, [c for c in failed if not (c.kind == "gnd" and c.net == "GND")],
                        log, maxRounds, deadline)
+    after = sum(1 for c in signal if not router.connected(c))
+    if after > before and router.rollback():
+        log(f"negotiation left {after} connections apart, pass 1 left {before}: pass 1's result kept")
+    router.commitTxn()
     # a ripped route may have been holding other pads together than its own two
     unrouted = reconnect(router, [c for c in conns if not (c.kind == "gnd" and c.net == "GND")],
                          log, deadline)
@@ -191,11 +200,13 @@ def routeAll(router, conns, bundles, block, log, maxRounds=40, deadline=None):
     return unrouted
 
 
-def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=False, log=print):
+def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=False, log=print,
+                openPour=True):
     """Write the routes into the board (copper not in keepZones / keepTracks removed
     first), pour ground on the outer layers that have no ground zone of their own (and
-    on the inner ones when innerGnd) and stitch the outer pours to the plane. Returns
-    tracks, vias, stitching vias added, GND fanouts the pour needs."""
+    on the inner ones when innerGnd) and stitch the outer pours to the plane (openPour:
+    also a via every stitchPitchMm of open pour). Returns tracks, vias, stitching vias
+    added, GND fanouts the pour needs."""
     ripCopper(board, keep=keepZones, keepTracks=keepTracks)
     nT, nV = writeRoutes(board, router)
     if "GND" not in router.planeNets:
@@ -213,7 +224,7 @@ def finishBoard(board, router, model, keepZones, conns, keepTracks=(), innerGnd=
         z.SetIslandRemovalMode(pcbnew.ISLAND_REMOVAL_MODE_NEVER)
     added = addPlanes(board, model.outline, planes, removeIslands=False)
     if router.k.stitch:
-        nSt, bare, stranded = stitchPours(board, router, conns)
+        nSt, bare, stranded = stitchPours(board, router, conns, openPour=openPour)
         log(f"stitching: {nSt} GND vias; {bare} pieces of pour with no room for a via")
     else:
         nSt, stranded = 0, []
@@ -461,10 +472,10 @@ def fixStarvedThermals(board, drc):
     return n
 
 
-def stitchPours(board, router, conns, net="GND"):
+def stitchPours(board, router, conns, net="GND", openPour=True):
     """Stitch the outer pours of `net` (filled, islands kept) to the plane: every piece
     gets stitchPerIsland vias or through-hole pads of the net, so none is fed only through
-    pad thermals, and open pour gets a via every stitchPitchMm. Vias keep stitchPadGapMm
+    pad thermals, and (openPour) open pour gets a via every stitchPitchMm. Vias keep stitchPadGapMm
     of bare board to every pad and stay out of rule areas. Returns (vias added, pieces
     that could not get even one, fanout connections whose pad sits on such a piece)."""
     k, sp = router.k, router.sp
@@ -547,6 +558,8 @@ def stitchPours(board, router, conns, net="GND"):
             bare += piece.area >= 1.0   # slivers between pads do not count
             starved += [c for c in fanouts if c not in starved and layer in c.a.layers
                         and piece.intersects(c.a.poly)]
+    if not openPour:
+        return added, bare, starved
     # open pour: one via per grid node that has none of its own yet
     p = k.stitchPitchMm
     minx, miny, maxx, maxy = router.m.outline.bounds
@@ -592,7 +605,13 @@ def reconnect(router, conns, log, deadline=None):
     need be); returns what is still apart."""
     apart = [c for c in conns if not router.connected(c)]
     if apart:
-        negotiate(router, apart, log, maxRounds=10, deadline=deadline)
+        # a finished connection is only traded away if the total gets better
+        router.begin()
+        negotiate(router, list(apart), log, maxRounds=10, deadline=deadline)
+        after = [c for c in conns if not router.connected(c)]
+        if len(after) >= len(apart) and router.rollback():
+            log(f"reconnect: no better ({len(apart)} -> {len(after)} apart); put back as it was")
+        router.commitTxn()
         apart = [c for c in conns if not router.connected(c)]
         log(f"reconnect: {len(apart)} connections still apart")
     return apart
@@ -856,7 +875,12 @@ def main():
                             deadline=t0 + args.minutes * 60 * 0.75)
         audit(router, log, "negotiation")
         cleanup(router, log, deadline=deadline)
-        reconnect(router, [c for c in conns if not (c.kind == "gnd" and c.net == "GND")], log, deadline)
+        unrouted = reconnect(router, [c for c in conns if not (c.kind == "gnd" and c.net == "GND")],
+                             log, deadline)
+        if unrouted:   # named from the final state: the tidying passes may have traded nets
+            log(f"unrouted after tidying: {len(unrouted)}: "
+                + ", ".join(f"{c.net}:{c.a.ref}.{c.a.num}->{(c.b.ref + '.' + c.b.num) if c.b else 'plane'}"
+                            for c in unrouted[:30]))
         skewRules = readSkewRules(os.path.join(srcDir, name + ".kicad_dru"))
 
         def skewBudget(net):
@@ -890,7 +914,7 @@ def main():
     if "GND" in router.planeNets and router.k.stitch:
         log(f"return vias: {router.returnVias()} GND vias beside signal vias")
     finish = lambda: finishBoard(board, router, model, keepZones, conns, keepTracks - router.droppedUuids,
-                                 not boardZones, log)
+                                 not boardZones, log, openPour=not args.keep_copper)
     nT, nV, nIsl, islandPads = finish()
     board.Save(outBoard)
     log(f"wrote {outBoard}: {nT} tracks, {nV} vias")
@@ -949,7 +973,10 @@ def main():
     if args.tidy != "off":
         judge = Judge(os.path.join(args.out, "tidy"), name, os.path.join(srcDir, name + ".kicad_pro"),
                       os.path.join(srcDir, name + ".kicad_dru"))
-        tidy(board, judge, log, report=args.tidy == "report")
+        # under --nets only those nets' copper is cleaned, and under --keep-copper only
+        # what this router drew (the designer's copper is theirs)
+        scope = {n for n in model.nets if any(fnmatch.fnmatchcase(n, p) for p in pats)} if args.nets else None
+        tidy(board, judge, log, report=args.tidy == "report", nets=scope, fixed=designer)
         if args.tidy != "report":
             board.Save(outBoard)
             drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))

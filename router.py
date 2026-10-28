@@ -231,6 +231,7 @@ class Router:
         self.children = {}
         self.netItems = {}
         self.flowNets = set()      # power nets whose current is planned from flows
+        self.txn = None            # what a transaction ripped and laid (begin / rollback)
         self.flowFloor = {}        # net: the narrowest its current-carrying copper may be (flows)
         self.inputNets = set()     # power nets that come in off a connector (flows)
         self.hist = np.zeros((self.NL, self.sp.H, self.sp.W), np.float32)
@@ -329,9 +330,12 @@ class Router:
         # the net class's track width is the designer's floor: a current only widens it
         classWidth = max(self.m.classes[base.cls].width, base.narrow)
         if conn.amps <= 0:
-            if conn.net in self.flowNets:  # a tap on a planned power net carries nothing
-                return NetRule(classWidth, base.narrow, base.clearance, base.viaDia,
-                               base.viaDrill, base.cls)
+            if conn.net in self.flowNets:
+                # a tap on a planned power net carries nothing (a gate hold, a sense pin):
+                # the class width, but a signal's via
+                sig = self.m.classes["Default"]
+                return NetRule(classWidth, base.narrow, base.clearance, sig.viaDia,
+                               sig.viaDrill, base.cls)
             return base
         need = ipcWidth(conn.amps, self.k)
         width = max(base.width, need, self.flowFloor.get(conn.net, 0.0))
@@ -1539,10 +1543,15 @@ class Router:
         planned connections of its net that it served come back."""
         ripped = [] if ripped is None else ripped
         if rid < 0:
+            if self.txn is not None:
+                self.txn["lossy"] = True   # the designer's or an earlier run's copper
             return self.ripSoft(rid, ripped)
         r = self.routes.pop(rid, None)
         if r is None:
             return ripped
+        if self.txn is not None and rid < self.txn["start"]:
+            r.oldItems = [self.sp.items[i] for i in r.items]
+            self.txn["ripped"].append(r)
         for iid in r.items:
             it = self.sp.remove(iid)
             self.netItems.get(it.net, set()).discard(iid)
@@ -1554,6 +1563,26 @@ class Router:
         for p in r.parents:
             self.children.get(p, set()).discard(rid)
         return ripped
+
+    def begin(self):
+        """Start remembering what is ripped and laid, so it can all be undone (rollback)."""
+        self.txn = {"start": self.nextRid, "ripped": [], "lossy": False}
+
+    def commitTxn(self):
+        self.txn = None
+
+    def rollback(self):
+        """Undo everything since begin(): the routes laid since are ripped and the routes
+        ripped since are put back as they were. False (and nothing undone) when copper that
+        is not a route of this run was ripped or nudged in the meantime."""
+        txn, self.txn = self.txn, None
+        if txn is None or txn["lossy"]:
+            return False
+        for rid in sorted((r for r in self.routes if r >= txn["start"]), reverse=True):
+            self.rip(rid)
+        for r in txn["ripped"]:
+            self.restore(r)
+        return True
 
     # ---- cleanup -----------------------------------------------------------------------
     def routeCost(self, rid):
@@ -1841,12 +1870,13 @@ class Router:
             find(it.iid)
             if it.net == HARD:
                 continue
-            anchors = [(it.layers[0], q) for q in it.pts] if it.kind == "track" else \
-                [(l, it.pts[0]) for l in it.layers]
-            for l, q in anchors:
-                pt = Point(q)
-                for o in self.sp.query([l], (q[0], q[1], q[0], q[1])):
-                    if o.iid == it.iid or o.net != it.net or not o.geom.buffer(1e-3).contains(pt):
+            # joined the way KiCad joins copper: any overlap on a shared layer, not only a
+            # track end inside the other shape (a track whose width covers a pad's edge,
+            # a via whose rim overlaps a track)
+            for l in it.layers:
+                for o in self.sp.query([l], it.geom.bounds):
+                    if o.iid == it.iid or o.net != it.net or l not in o.layers \
+                            or not o.geom.intersects(it.geom):
                         continue
                     if o.kind == "pad":
                         parent[find(it.iid)] = find(("pad", o.pad.pid))
@@ -1935,6 +1965,8 @@ class Router:
         within nudgeLenSlack x its length + nudgeLenAddMm; otherwise everything is put back
         as it was. True when it holds."""
         k = self.k
+        if self.txn is not None:
+            self.txn["lossy"] = True   # the designer's copper moves: no undoing past this
         snap = {rid: (*self.existing[rid], list(self.existingItems[rid])) for rid in pieces}
         freed = {}
         for rid in pieces:
@@ -3655,16 +3687,16 @@ class Router:
         return [sp.toMm(ii[x] + a0, jj[x] + b0) for x in np.argsort(d)[:n]]
 
     def returnVias(self, net="GND", reach=1.5, placeMm=2.0):
-        """A plane via next to every signal via that has none within reach (placed within
-        placeMm, as near as the pad gap allows): the return current of a track that changes
-        layers changes planes there too."""
+        """A plane via next to every signal via this run laid that has none within reach
+        (placed within placeMm, as near as the pad gap allows): the return current of a
+        track that changes layers changes planes there too. The designer's vias are theirs."""
         sp = self.sp
         ok = self.stitchMask(net)
         nid = self.netId[net]
         gnd = [it.pts[0] for it in sp.items.values() if it.kind == "via" and it.net == nid]
         added = 0
         for it in list(sp.items.values()):
-            if it.kind != "via" or it.net == nid:
+            if it.kind != "via" or it.net == nid or it.route not in self.routes:
                 continue
             x, y = it.pts[0]
             if any(math.dist(g, (x, y)) <= reach for g in gnd):

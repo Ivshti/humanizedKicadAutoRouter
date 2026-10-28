@@ -804,18 +804,38 @@ def keepSafe(board, edits, judge, base, log, label):
     return keptA + keptB, base
 
 
-def tidy(board, judge, log, report=False, classes=CLASSES, plane="GND"):
+def inScope(edit, nets, fixed):
+    """Whether an edit touches only copper it may: of `nets` (None: any net) and not among
+    the `fixed` uuids (the designer's copper)."""
+    for op in edit:
+        it = op[1]
+        if op[0] in ("pad", "solid"):
+            if nets is not None and it.GetNetname() not in nets:
+                return False
+            continue
+        if (nets is not None and it.GetNetname() not in nets) or it.m_Uuid.AsString() in fixed:
+            return False
+    return True
+
+
+def tidy(board, judge, log, report=False, classes=CLASSES, plane="GND", nets=None, fixed=frozenset()):
     """Run the clean-up classes in order. report: list what each class would do and
-    change nothing. Returns {class: edits kept (or found)}."""
+    change nothing. nets: only copper of these nets is edited (None: every net); fixed:
+    uuids of copper that is never edited (the designer's, when routing around it).
+    Returns {class: edits kept (or found)}."""
     base, apart = judge(board)
     allNets = {t.GetNetname() for t in board.GetTracks()}
     complete = allNets - apart
+    scope = None if nets is None else set(nets)
     done = {}
+
+    def find(cls, which):
+        return [e for e in FINDERS[cls](board, which) if inScope(e, scope, fixed)]
     for cls in classes:
-        nets = complete if cls in COMPLETE_ONLY else None
+        which = complete if cls in COMPLETE_ONLY else None
         total = []
         for _ in range(20):   # dangling stubs peel off one piece per round
-            edits = FINDERS[cls](board, nets)
+            edits = find(cls, which)
             if report:
                 total = edits
                 break
@@ -844,7 +864,7 @@ def tidy(board, judge, log, report=False, classes=CLASSES, plane="GND"):
             for _ in range(5):
                 more = 0
                 for again in ("dangling", "loneVia"):
-                    edits = FINDERS[again](board, complete)
+                    edits = find(again, complete)
                     kept, base = keepSafe(board, keepJoined(board, edits, log, again), judge, base, log, again)
                     (done["dangling"] if again == "dangling" else total).extend(kept)
                     more += len(kept)
