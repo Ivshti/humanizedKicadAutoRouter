@@ -804,6 +804,44 @@ def keepSafe(board, edits, judge, base, log, label):
     return keptA + keptB, base
 
 
+def splitDanglingTees(board):
+    """KiCad does not always join a track end that lies on the middle of another track of
+    its net (on its centreline, at a 45-degree track most of all) and reports it dangling.
+    Each such host track is split at that point, so the two share an end, as a person's
+    T-joint does; every other track stays as routed. Returns how many were split."""
+    board.BuildConnectivity()
+    cn = board.GetConnectivity()
+    tracks = [t for t in board.GetTracks() if t.GetClass() == "PCB_TRACK"]
+    split = 0
+    for t in tracks:
+        pos = pcbnew.VECTOR2I()
+        if not cn.TestTrackEndpointDangling(t, True, pos):
+            continue
+        q = (pos.x, pos.y)
+        for host in tracks:
+            if host is t or host.GetNetCode() != t.GetNetCode() or host.GetLayer() != t.GetLayer():
+                continue
+            a, b = xy(host.GetStart()), xy(host.GetEnd())
+            line = LineString([a, b])
+            if line.length < 1 or line.distance(Point(q)) > host.GetWidth() / 2 \
+                    or min(math.dist(q, a), math.dist(q, b)) < host.GetWidth() / 2:
+                continue
+            c = line.interpolate(line.project(Point(q)))
+            mid = pcbnew.VECTOR2I(int(round(c.x)), int(round(c.y)))
+            tail = pcbnew.PCB_TRACK(board)
+            tail.SetNet(host.GetNet())
+            tail.SetLayer(host.GetLayer())
+            tail.SetWidth(host.GetWidth())
+            tail.SetStart(mid)
+            tail.SetEnd(host.GetEnd())
+            host.SetEnd(mid)
+            board.Add(tail)
+            t.SetEnd(mid) if math.dist(xy(t.GetEnd()), q) < math.dist(xy(t.GetStart()), q) else t.SetStart(mid)
+            split += 1
+            break
+    return split
+
+
 def inScope(edit, nets, fixed):
     """Whether an edit touches only copper it may: of `nets` (None: any net) and not among
     the `fixed` uuids (the designer's copper)."""
