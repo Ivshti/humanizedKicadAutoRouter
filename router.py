@@ -748,7 +748,8 @@ class Router:
         # one cell of raster slack: a pad corner can rasterise one cell short
         viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: np.isin(a, nets)) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
         if k.viaPadGapMm > 0:
-            viaok &= self.padEdgeDist[i0:i1, j0:j1] >= rv + k.viaPadGapMm + g
+            # not in a ball grid: a fanout via between balls is how a BGA is escaped
+            viaok &= (self.padEdgeDist[i0:i1, j0:j1] >= rv + k.viaPadGapMm + g) | self.gridArea()[i0:i1, j0:j1]
         viaok &= self.holeDist[i0:i1, j0:j1] >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: np.isin(a, nets)) >= \
             rule.viaDrill + self.m.minHoleToHole + m
@@ -2442,6 +2443,17 @@ class Router:
         """The courtyards of the board's ball grids."""
         return [fp.courtyard for ref, fp in self.m.footprints.items()
                 if fp.courtyard is not None and self.gridArray(ref) is not None]
+
+    def gridArea(self):
+        """Board raster: inside the courtyard of a ball grid."""
+        if getattr(self, "_gridArea", None) is None:
+            sp = self.sp
+            self._gridArea = np.zeros((sp.H, sp.W), bool)
+            for crt in self.gridCourtyards():
+                win, mask = sp.rasterMask(crt)
+                i0, j0, i1, j1 = win
+                self._gridArea[i0:i1, j0:j1] |= mask
+        return self._gridArea
 
     def pairEscape(self, padL, padF, rule):
         """How a pair leaves a ball grid when its two balls sit side by side across the
