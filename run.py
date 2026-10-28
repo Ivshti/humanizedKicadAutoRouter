@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import pcbnew
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 
 from boardModel import (B, F, INNER_KICAD, LAYER_BY_NAME, LAYER_NAMES, PHYSICAL, boardPlanes,
                         existingCopper, fillZones, innerPlaneFills, loadModel, planeLayersOf,
@@ -478,6 +478,33 @@ def fixStarvedThermals(board, drc):
     return n
 
 
+def acrossAntennas(router, conns, unrouted, detour=1.8):
+    """Placement notes: connections whose straight line crosses an antenna's body (no via
+    there, no track on its side) and that are unrouted or detour more than `detour` x."""
+    antennas = [(ref, side, body) for ref, side, body in router.bodies if ref.startswith("ANT")]
+    out = []
+    for c in conns:
+        if c.b is None or c.kind not in ("sig", "pwr"):
+            continue
+        line = LineString([c.a.center, c.b.center])
+        hit = [ref for ref, side, body in antennas if line.intersects(body)]
+        if not hit:
+            continue
+        if c in unrouted:
+            how = "unrouted"
+        elif c.rid in router.routes:
+            cost, nVia = router.routeCost(c.rid)
+            ratio = (cost - nVia * router.k.viaMm) / max(line.length, 1e-3)
+            if ratio < detour:
+                continue
+            how = f"{ratio:.1f}x its straight line, {nVia} vias"
+        else:
+            continue
+        out.append(f"placement: {c.net} {c.a.ref}.{c.a.num} -> {c.b.ref}.{c.b.num} crosses the antenna "
+                   f"{', '.join(hit)} (no via under it, no track on its side): {how}")
+    return out
+
+
 def gndMissed(drc):
     """GND pads KiCad's DRC reports apart from the rest of ground: ["REF.pad", ...]."""
     return sorted({m.group(2) + "." + m.group(1) for u in drc["unconnected_items"] for it in u["items"]
@@ -903,6 +930,8 @@ def main():
             log(f"unrouted after tidying: {len(unrouted)}: "
                 + ", ".join(f"{c.net}:{c.a.ref}.{c.a.num}->{(c.b.ref + '.' + c.b.num) if c.b else 'plane'}"
                             for c in unrouted[:30]))
+        for line in acrossAntennas(router, conns, unrouted):
+            log(line)
         skewRules = readSkewRules(os.path.join(srcDir, name + ".kicad_dru"))
 
         def skewBudget(net):
