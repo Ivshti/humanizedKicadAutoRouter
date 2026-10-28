@@ -166,6 +166,22 @@ check the following.
    example `F.Cu signal / In1.Cu plane GND / In2.Cu signal / In3.Cu signal /
    In4.Cu plane GND / B.Cu signal`. Vias go through the whole board; blind and
    buried vias are not used.
+
+   A plane layer can also carry power, the way designers run supplies on the
+   ground layer with the pour flowing round them: write a `.kicad_dru` rule that
+   keeps every track off that layer except the power nets you name, e.g.
+
+   ```
+   (rule "In2: GND and power only"
+     (condition "A.Type == 'Track' && A.NetName != 'GND' && A.NetName != 'V3V3'")
+     (layer "In2.Cu")
+     (constraint disallow track))
+   ```
+
+   Those nets may then run trunks on that layer and drop to their pads by
+   via; the log lists them (`power on In2.Cu (design rules): ...`). Inner copper
+   carries less current than outer copper of the same width, so check the
+   trunks' current yourself.
 4. **Planes.** Copper zones you have drawn on the inner layers are kept exactly
    as they are: a solid ground plane, or a ground plane with a power pour on
    another inner layer, for example. Pads of a plane's net over the plane get

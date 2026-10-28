@@ -356,6 +356,28 @@ def readSkewRules(druPath):
     return out
 
 
+def readLayerNets(druPath):
+    """Nets a .kicad_dru lets onto a layer that it otherwise keeps tracks off: {layer name:
+    set of nets} from rules of the form (condition "A.Type == 'Track' && A.NetName != 'X'
+    && A.NetName != 'Y' ...") (layer "In2.Cu") (constraint disallow track). Rules of any
+    other form are left to KiCad's DRC."""
+    if not os.path.exists(druPath):
+        return {}
+    with open(druPath) as f:
+        text = f.read()
+    out = {}
+    for rule in re.split(r"\(rule\s", text)[1:]:
+        layer = re.search(r'\(layer\s+"([^"]+)"\)', rule)
+        cond = re.search(r'\(condition\s+"([^"]*)"\)', rule)
+        if not layer or not cond or not re.search(r"\(constraint\s+disallow\s+track\)", rule):
+            continue
+        terms = [t.strip() for t in cond.group(1).split("&&")]
+        nets = [m.group(1) for t in terms for m in [re.fullmatch(r"A\.NetName\s*!=\s*'([^']+)'", t)] if m]
+        if nets and all(t == "A.Type == 'Track'" or re.fullmatch(r"A\.NetName\s*!=\s*'[^']+'", t) for t in terms):
+            out.setdefault(layer.group(1), set()).update(nets)
+    return out
+
+
 def readCourtyardClearances(druPath):
     """Clearances a .kicad_dru sets inside a part's courtyard: {ref: mm} from rules with an
     `insideCourtyard('REF')` condition and a `(constraint clearance (min X))` (a BGA's

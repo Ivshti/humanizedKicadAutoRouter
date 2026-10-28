@@ -234,6 +234,7 @@ class Router:
         self.txn = None            # what a transaction ripped and laid (begin / rollback)
         self.flowFloor = {}        # net: the narrowest its current-carrying copper may be (flows)
         self.inputNets = set()     # power nets that come in off a connector (flows)
+        self.powerLayers = {}      # plane layer: power nets the design rules let run on it
         self.hist = np.zeros((self.NL, self.sp.H, self.sp.W), np.float32)
         self.stats = {"searches": 0, "searchS": 0.0, "costS": 0.0, "commitS": 0.0}
         self.corridors = None      # Corridors planner, once the bundle phase starts
@@ -1724,7 +1725,9 @@ class Router:
             return None
         home = c.a.side
         items = [self.sp.items[i] for i in r.items]
-        away = [it for it in items if it.kind == "track" and it.layers[0] != home]
+        # a power net's run on its inner power layer is its trunk, not a hop
+        away = [it for it in items if it.kind == "track" and it.layers[0] != home
+                and it.layers[0] not in self.powerLayers]
         if not away or not any(it.kind == "via" for it in items):
             return None
         blockers = set()

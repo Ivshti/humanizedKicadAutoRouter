@@ -22,9 +22,10 @@ import numpy as np
 import pcbnew
 from shapely.geometry import Point
 
-from boardModel import (B, F, INNER_KICAD, LAYER_NAMES, PHYSICAL, boardPlanes, existingCopper,
-                        fillZones, innerPlaneFills, loadModel, planeLayersOf, polySetToShapely,
-                        readCourtyardClearances, readSkewRules, ripCopper)
+from boardModel import (B, F, INNER_KICAD, LAYER_BY_NAME, LAYER_NAMES, PHYSICAL, boardPlanes,
+                        existingCopper, fillZones, innerPlaneFills, loadModel, planeLayersOf,
+                        polySetToShapely, readCourtyardClearances, readLayerNets, readSkewRules,
+                        ripCopper)
 from emit import addPlanes, runDrc, writeItem, writeRoutes
 from corridors import Corridors, splitBundles
 from flowcheck import squeezes
@@ -34,6 +35,7 @@ from tidy import Judge, tidy
 
 
 SIGNAL_LAYERS = [F, B]   # set from the router's stack in main()
+POWER_LAYERS = {}        # plane layer: the power nets the design rules let run on it (main())
 
 
 def layersFor(c):
@@ -43,6 +45,8 @@ def layersFor(c):
         return [c.layerLock]
     if c.strict:
         return [c.prefLayer]
+    if c.kind == "pwr":
+        return list(SIGNAL_LAYERS) + [l for l, nets in POWER_LAYERS.items() if c.net in nets]
     return list(SIGNAL_LAYERS)
 
 
@@ -57,6 +61,8 @@ def viaMmFor(c, k):
         # a supply-plane fanout would rather share a via of its net a short walk away
         # than set its own beside it; ground fanouts are cheap (the pour joins them anyway)
         return 0.4 if c.net == "GND" else 1.5
+    if c.kind == "pwr" and any(c.net in nets for nets in POWER_LAYERS.values()):
+        return k.viaMm   # power with an inner layer of its own: a trunk there, drops by via
     # a person keeps power paths on one layer; a tap that carries no current (a flow net's
     # gate hold or sense pin) is priced like a signal
     if c.amps > 1.0 or (c.kind == "pwr" and (c.trunk or c.amps > 0)):
@@ -787,6 +793,16 @@ def main():
     log("stack: " + " / ".join(
         f"{LAYER_NAMES[l]} " + ("plane " + "+".join(sorted(router.planeLayers[l])) if l in router.planeLayers
                                 else "signal") for l in PHYSICAL))
+    # a plane layer the design rules open to some power nets carries them, the plane
+    # poured round them (the Nano's In2)
+    POWER_LAYERS.clear()
+    for lname, nets in readLayerNets(os.path.join(srcDir, name + ".kicad_dru")).items():
+        l = LAYER_BY_NAME.get(lname)
+        extra = {n for n in nets if n in model.nets and router.powerClass(n)} - router.planeLayers.get(l, set())
+        if l in router.planeLayers and extra:
+            POWER_LAYERS[l] = extra
+            log(f"power on {lname} (design rules): {', '.join(sorted(extra))}")
+    router.powerLayers = dict(POWER_LAYERS)
     courtyards = readCourtyardClearances(os.path.join(srcDir, name + ".kicad_dru"))
     if courtyards:
         router.setCourtyardClearances(courtyards)
