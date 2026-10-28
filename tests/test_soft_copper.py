@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import pcbnew  # noqa: E402
 
-from boardModel import existingCopper, loadModel  # noqa: E402
+from boardModel import B, F, existingCopper, loadModel  # noqa: E402
 from router import Knobs, Router  # noqa: E402
 from run import negotiate  # noqa: E402
 from strategy import plan  # noqa: E402
@@ -86,9 +86,9 @@ def attempt(soft):
     r.allConns = conns
     a = next(c for c in conns if c.net == "A")
     b_ = next(c for c in conns if c.net == "B")
-    a.strict, a.prefLayer = True, 0          # A may not leave the top layer
+    a.strict, a.prefLayer = True, F          # A may not leave the top layer
     import run
-    run.layersFor = lambda c: [0] if c.strict else [0, 3]
+    run.layersFor = lambda c: [F] if c.strict else [F, B]
     negotiate(r, [a], lambda m: None, maxRounds=10)
     return r, a, b_, uuids
 

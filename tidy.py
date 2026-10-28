@@ -209,7 +209,7 @@ def strictGraph(board, net, gone=()):
     Returns ({key: set of keys}, pad keys); pads are ("pad", i), copper its uuid."""
     gone = set(gone)
     items = [t for t in board.GetTracks() if t.GetNetname() == net and uid(t) not in gone]
-    layers = (pcbnew.F_Cu, pcbnew.In1_Cu, pcbnew.In2_Cu, pcbnew.B_Cu)
+    layers = tuple(board.GetEnabledLayers().CuStack())   # every copper layer of the board
     pads = [pd for fp in board.GetFootprints() for pd in fp.Pads() if pd.GetNetname() == net]
     geoms, meta = [], []   # meta: (key, layers, kind)
     for i, pd in enumerate(pads):

@@ -14,7 +14,6 @@ import shapely
 from native import edt
 from shapely.geometry import LineString, Point, box
 
-NLAYERS = 4
 HARD = -1   # owner value for copper/obstacles that belong to no routable net
 
 
@@ -38,7 +37,8 @@ class Item:
 
 
 class Space:
-    def __init__(self, outline, grid, margin, edgeClearance, defaultClearance):
+    def __init__(self, outline, grid, margin, edgeClearance, defaultClearance, nLayers):
+        self.L = nLayers   # copper layers (index 0 F.Cu, 1 B.Cu, then the inner ones)
         self.g = grid
         self.defaultClearance = defaultClearance
         self.margin = margin
@@ -46,19 +46,19 @@ class Space:
         self.x0, self.y0 = minx - 0.5, miny - 0.5
         self.W = int(math.ceil((maxx - minx + 1.0) / grid)) + 1
         self.H = int(math.ceil((maxy - miny + 1.0) / grid)) + 1
-        self.occ = np.zeros((NLAYERS, self.H, self.W), np.int16)
-        self.fixed = np.zeros((NLAYERS, self.H, self.W), np.int16)  # pads, holes, edge only
+        self.occ = np.zeros((self.L, self.H, self.W), np.int16)
+        self.fixed = np.zeros((self.L, self.H, self.W), np.int16)  # pads, holes, edge only
         # copper of a net class whose clearance is below the default (fine-pitch classes):
         # a search of such a class keeps only its own clearance from this copper
-        self.fine = np.zeros((NLAYERS, self.H, self.W), bool)
-        self.trackKeep = np.zeros((NLAYERS, self.H, self.W), bool)
+        self.fine = np.zeros((self.L, self.H, self.W), bool)
+        self.trackKeep = np.zeros((self.L, self.H, self.W), bool)
         self.viaKeep = np.zeros((self.H, self.W), bool)
         self.smdPad = np.zeros((self.H, self.W), np.int16)   # SMD pad owner on F or B
         self.viaAt = np.zeros((self.H, self.W), np.int16)    # via centre owner
         self.holeMask = np.zeros((self.H, self.W), bool)     # every drilled hole
         self.items = {}
         self.nextId = 1
-        self.buckets = [defaultdict(set) for _ in range(NLAYERS)]
+        self.buckets = [defaultdict(set) for _ in range(self.L)]
         self.bucket = 2.0
         self.outline = outline
         self.edgeClearance = edgeClearance
@@ -68,7 +68,7 @@ class Space:
         shapely.prepare(inner)
         ys, xs = self.cellCenters((0, 0, self.H, self.W))
         inside = shapely.contains_xy(inner, xs, ys)
-        for l in range(NLAYERS):
+        for l in range(self.L):
             self.occ[l][~inside] = HARD
             self.fixed[l][~inside] = HARD
 
@@ -146,7 +146,7 @@ class Space:
                 self.viaAt[i, j] = 0
         # restamp same-net neighbours that shared those cells
         minx, miny, maxx, maxy = item.geom.bounds
-        for other in self.query(range(NLAYERS), (minx, miny, maxx, maxy)):
+        for other in self.query(range(self.L), (minx, miny, maxx, maxy)):
             if other.net == item.net:
                 self.stamp(other, record=False)
         return item

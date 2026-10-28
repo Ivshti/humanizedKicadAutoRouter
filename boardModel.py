@@ -1,7 +1,8 @@
 """Read a KiCad board into plain geometry: pads, nets, net classes, keepouts, outline.
 
-Runs under KiCad's bundled Python (pcbnew + shapely). Units are mm; layer indices are
-stack order: 0 F.Cu, 1 In1.Cu, 2 In2.Cu, 3 B.Cu.
+Runs under KiCad's bundled Python (pcbnew + shapely). Units are mm. Layer indices: 0 is
+F.Cu and 1 is B.Cu on every board, and In<k>.Cu is k + 1, so the outer layers keep their
+index whatever the layer count. PHYSICAL lists them in stack order (F first, B last).
 """
 import fnmatch
 import json
@@ -14,9 +15,71 @@ from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 NM = 1e6
-F, IN1, IN2, B = 0, 1, 2, 3
-KICAD_LAYERS = {F: pcbnew.F_Cu, IN1: pcbnew.In1_Cu, IN2: pcbnew.In2_Cu, B: pcbnew.B_Cu}
-LAYER_NAMES = {F: "F.Cu", IN1: "In1.Cu", IN2: "In2.Cu", B: "B.Cu"}
+F, B = 0, 1
+# filled by setStack() for the board being routed (4 layers until a board says otherwise);
+# updated in place, so every module that imported them sees the board's stack
+KICAD_LAYERS = {}        # index -> pcbnew layer id
+LAYER_NAMES = {}         # index -> "F.Cu", "In1.Cu", ...
+LAYER_BY_NAME = {}       # "In1.Cu" -> index
+INNER = []               # inner layer indices, in stack order
+INNER_KICAD = []         # their pcbnew ids
+PHYSICAL = []            # every layer index in stack order
+
+
+def setStack(nCopper):
+    """Layer tables for a board with nCopper copper layers (2, 4, 6, 8, ...)."""
+    if nCopper < 2 or nCopper % 2:
+        raise ValueError(f"{nCopper} copper layers: an even count of 2 or more is expected")
+    for t in (KICAD_LAYERS, LAYER_NAMES, LAYER_BY_NAME):
+        t.clear()
+    del INNER[:], INNER_KICAD[:], PHYSICAL[:]
+    KICAD_LAYERS[F], KICAD_LAYERS[B] = pcbnew.F_Cu, pcbnew.B_Cu
+    LAYER_NAMES[F], LAYER_NAMES[B] = "F.Cu", "B.Cu"
+    for k in range(1, nCopper - 1):
+        KICAD_LAYERS[k + 1] = getattr(pcbnew, f"In{k}_Cu")
+        LAYER_NAMES[k + 1] = f"In{k}.Cu"
+        INNER.append(k + 1)
+        INNER_KICAD.append(KICAD_LAYERS[k + 1])
+    LAYER_BY_NAME.update({n: i for i, n in LAYER_NAMES.items()})
+    PHYSICAL.extend([F] + INNER + [B])
+
+
+def defaultPlaneLayers(nCopper):
+    """Inner layers that carry ground on a board with no inner zones of its own, so every
+    signal layer sits next to a plane: 4 layers S/G/G/S, 6 layers S/G/S/S/G/S, 8 layers
+    S/G/S/G/G/S/G/S; more layers alternate plane and signal pairs the same way."""
+    inner = [k + 1 for k in range(1, nCopper - 1)]
+    if nCopper <= 4:
+        return inner
+    if nCopper == 6:
+        return [inner[0], inner[3]]
+    if nCopper == 8:
+        return [inner[0], inner[2], inner[3], inner[5]]
+    # S/G/S/G ... G/S/G/S: a plane after every signal layer, mirrored about the middle
+    half = len(inner) // 2
+    top = [inner[i] for i in range(0, half, 2)]
+    return top + [inner[-1 - (l - inner[0])] for l in top]
+
+
+def planeLayersOf(zones):
+    """{inner layer index: nets of the zones on it} for the board's own inner zones."""
+    out = {}
+    for z in zones:
+        for l in INNER:
+            if z.IsOnLayer(KICAD_LAYERS[l]):
+                out.setdefault(l, set()).add(z.GetNetname())
+    return out
+
+
+def stackOf(board):
+    """Set the layer tables from the board's own copper layer count; returns it."""
+    n = board.GetCopperLayerCount()
+    if len(KICAD_LAYERS) != n:
+        setStack(n)
+    return n
+
+
+setStack(4)
 
 
 @dataclass
@@ -110,6 +173,7 @@ def readClasses(proPath):
 
 
 def loadModel(board, proPath):
+    stackOf(board)
     classes, patterns, rules = readClasses(proPath)
 
     outlineSet = pcbnew.SHAPE_POLY_SET()
@@ -194,9 +258,6 @@ def zoneToKeepout(z):
                    z.GetDoNotAllowZoneFills())
 
 
-INNER_KICAD = (pcbnew.In1_Cu, pcbnew.In2_Cu)
-
-
 def ripCopper(board, keep=(), keepTracks=()):
     """Remove every track, via and copper zone except the zones in `keep` and the tracks
     and vias whose uuids are in `keepTracks`; rule areas stay (they are design intent)."""
@@ -210,12 +271,10 @@ def ripCopper(board, keep=(), keepTracks=()):
             board.Delete(z)
 
 
-LAYER_BY_NAME = {"F.Cu": F, "In1.Cu": IN1, "In2.Cu": IN2, "B.Cu": B}
-
-
 def existingCopper(board):
     """The board's tracks [(net, layer, p1, p2, width, uuid)] (an arc as two chords) and vias
     [(net, p, dia, drill, uuid)], in mm, plus the uuids of all of them."""
+    stackOf(board)
     tracks, vias, uuids = [], [], set()
     mm = lambda v: (v.x / NM, v.y / NM)
     for t in board.GetTracks():
@@ -227,7 +286,7 @@ def existingCopper(board):
             continue
         layer = LAYER_BY_NAME.get(t.GetLayerName())
         if layer is None:
-            raise ValueError(f"track of {net} on {t.GetLayerName()}: only 4-layer boards are supported")
+            raise ValueError(f"track of {net} on {t.GetLayerName()}, not a copper layer of this board")
         w = t.GetWidth() / NM
         if t.GetClass() == "PCB_ARC":
             a, m, b = mm(t.GetStart()), mm(t.GetMid()), mm(t.GetEnd())
@@ -240,6 +299,7 @@ def existingCopper(board):
 def boardPlanes(board):
     """The board's own planes: its copper zones on the inner layers (teardrops are not
     planes). They are kept as the designer drew them; everything else is routed afresh."""
+    stackOf(board)
     zones = [board.GetArea(i) for i in range(board.GetAreaCount())]
     return [z for z in zones if not z.GetIsRuleArea() and not z.IsTeardropArea()
             and z.GetNetname() and any(z.IsOnLayer(l) for l in INNER_KICAD)]

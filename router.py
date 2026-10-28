@@ -20,9 +20,9 @@ from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 import native
-from boardModel import B, F, IN1, IN2
+from boardModel import B, F, KICAD_LAYERS, LAYER_NAMES, PHYSICAL, defaultPlaneLayers
 from native import edt
-from space import HARD, NLAYERS, Item, Space
+from space import HARD, Item, Space
 
 # shapely's round shapes are polygons inside the true circle; scale them so the polygon
 # lies outside it and every clearance it passes holds for the real round copper
@@ -217,7 +217,9 @@ class Router:
         self.log = log
         self.kernel = native.kernel
         dc = model.classes["Default"].clearance
-        self.sp = Space(model.outline, self.k.grid, self.k.margin, model.edgeClearance, dc)
+        self.NL = len(KICAD_LAYERS)
+        self.allLayers = tuple(range(self.NL))
+        self.sp = Space(model.outline, self.k.grid, self.k.margin, model.edgeClearance, dc, self.NL)
         self.sp.defaultClearance = dc
         self.netId = {n: i + 1 for i, n in enumerate(sorted(model.netClass))}
         self.netName = {i: n for n, i in self.netId.items()}
@@ -231,12 +233,26 @@ class Router:
         self.flowNets = set()      # power nets whose current is planned from flows
         self.flowFloor = {}        # net: the narrowest its current-carrying copper may be (flows)
         self.inputNets = set()     # power nets that come in off a connector (flows)
-        self.hist = np.zeros((NLAYERS, self.sp.H, self.sp.W), np.float32)
+        self.hist = np.zeros((self.NL, self.sp.H, self.sp.W), np.float32)
         self.stats = {"searches": 0, "searchS": 0.0, "costS": 0.0, "commitS": 0.0}
         self.corridors = None      # Corridors planner, once the bundle phase starts
-        # each outer layer's main diagonal (corridors.py axis numbering); the other diagonal
-        # costs extra on it, so the two layers run their long wiring crosswise
+        # the stack: inner layers that hold a plane (the board's own zones, else the default
+        # stack) stay planes, every other layer carries signals
+        planeLayers = getattr(model, "planeLayers", None)
+        if planeLayers is None:
+            planeLayers = {l: {"GND"} for l in defaultPlaneLayers(self.NL)}
+        self.planeLayers = planeLayers
+        self.signalLayers = [l for l in PHYSICAL if l not in planeLayers]   # stack order
+        # each signal layer's main direction (corridors.py axis numbering): the outer layers
+        # run opposite diagonals, the inner signal layers alternate horizontal and vertical
+        # starting along the board's long side; running along the opposite axis costs extra
         self.mainAxis = {F: 3, B: 1}
+        minx, miny, maxx, maxy = model.outline.bounds
+        axis = 0 if maxx - minx >= maxy - miny else 2
+        for l in self.signalLayers:
+            if l not in (F, B):
+                self.mainAxis[l] = axis
+                axis = 2 - axis
         self.asForeign = False     # while True, new track items belong to no net (see trackItem)
         self.entryWide = False     # set by entryLegs: its legs are checked at the full width
         self.pairCrossed = False   # set by layPair: the last centreline would cross the pair
@@ -354,7 +370,7 @@ class Router:
         for (x, y, r, hnet) in self.m.holes:
             geom = Point(x, y).buffer(r * CIRC, 16)
             hid = self.netId[hnet] if hnet else HARD
-            it = Item(0, hid, "hole", tuple(range(NLAYERS)), geom, 0.0, pts=((x, y),), drill=2 * r)
+            it = Item(0, hid, "hole", self.allLayers, geom, 0.0, pts=((x, y),), drill=2 * r)
             sp.add(it)
             win, mask = sp.rasterMask(geom)
             if mask.size:
@@ -363,10 +379,10 @@ class Router:
             if hc > 0 and hid == HARD:
                 win, mask = sp.rasterMask(geom, hc)
                 i0, j0, i1, j1 = win
-                for l in range(NLAYERS):
+                for l in range(self.NL):
                     sp.occ[l, i0:i1, j0:j1][mask & (sp.occ[l, i0:i1, j0:j1] == 0)] = HARD
                     sp.fixed[l, i0:i1, j0:j1][mask & (sp.fixed[l, i0:i1, j0:j1] == 0)] = HARD
-        edge = Item(0, HARD, "edge", tuple(range(NLAYERS)), self.m.outline.boundary, 0.0)
+        edge = Item(0, HARD, "edge", self.allLayers, self.m.outline.boundary, 0.0)
         sp.add(edge)
         for ko in self.m.keepouts:
             it = Item(0, HARD, "keepout", tuple(ko.layers), ko.poly, 0.0,
@@ -459,7 +475,7 @@ class Router:
         """Human conventions as rasters: no foreign copper under module/antenna bodies,
         keep GND thermal spokes free, and a static distance-to-hole field."""
         sp, k = self.sp, self.k
-        self.bodyKeep = np.zeros((NLAYERS, sp.H, sp.W), bool)
+        self.bodyKeep = np.zeros((self.NL, sp.H, sp.W), bool)
         self.bodyViaKeep = np.zeros((sp.H, sp.W), bool)
         self.bodies = []
         for fp in self.m.footprints.values():
@@ -480,7 +496,7 @@ class Router:
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
             self.bodyViaKeep[i0:i1, j0:j1] |= mask
         self.jumpChannels = self.findJumpChannels() if k.jumps else []
-        self.thermalCost = np.zeros((NLAYERS, sp.H, sp.W), np.float32)
+        self.thermalCost = np.zeros((self.NL, sp.H, sp.W), np.float32)
         for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
             if not pad.smd:
                 continue
@@ -672,8 +688,8 @@ class Router:
                 c[other[li] & ~own[li]] *= k.hugMult
             if pair is not None:
                 c[pair[0][li]] *= k.pairMult
-            if conn.corridor is not None and l in (F, B):
-                inside = self.corridors.fine(conn.corridor, 0 if l == F else 1, win)
+            if conn.corridor is not None and l in self.corridors.index:
+                inside = self.corridors.fine(conn.corridor, self.corridors.index[l], win)
                 c[~inside & ~escape] *= k.corridorOut
             if soft is not None:
                 c[soft] *= (1.0 + k.negotiatePenalty)
@@ -826,7 +842,14 @@ class Router:
                 if inner.is_empty:
                     inner = Point(item.pad.center).buffer(sp.g * 0.8)
                 cache[key] = sp.rasterMask(inner)
-            else:  # land on a pad: anywhere on its copper
+            elif not item.geom.contains(Point(item.pad.center)):
+                # a pad with no copper at its centre (a ring around a microphone's sound
+                # port): no entry leg pulls the end to the centre, so it must land a little
+                # in from the edge, inside KiCad's outline too (ours is rounded outward)
+                land = item.geom.buffer(-0.03)
+                win, mask = sp.rasterMask(land) if not land.is_empty else (None, np.zeros(0, bool))
+                cache[key] = (win, mask) if mask.size and mask.any() else self.cachedMask(item, "copper")
+            else:  # land on a pad: anywhere on its copper (the entry leg goes on to the centre)
                 cache[key] = self.cachedMask(item, "copper")
         return cache[key]
 
@@ -988,13 +1011,17 @@ class Router:
             cells.append((layers[li], i + win[0], j + win[1], bool(wideOk[li, i, j])))
         return cells, terminalVia
 
+    @staticmethod
+    def layerName(l):
+        return LAYER_NAMES[l]
+
     def layerDir(self, layers):
         """Extra cost per unit length along each axis, per search layer: the diagonal that
         is the other outer layer's main direction."""
         out = np.zeros((len(layers), 4), np.float32)
         for li, l in enumerate(layers):
             if l in self.mainAxis:
-                out[li, 4 - self.mainAxis[l]] = self.k.againstCost
+                out[li, (self.mainAxis[l] + 2) % 4] = self.k.againstCost
         return out
 
     # ---- geometry ----------------------------------------------------------------------
@@ -1039,7 +1066,7 @@ class Router:
 
     def viaItem(self, net, p, rule, rid):
         geom = Point(p).buffer(rule.viaDia / 2 * CIRC, 16)
-        return Item(0, self.netId[net], "via", tuple(range(NLAYERS)), geom, rule.clearance,
+        return Item(0, self.netId[net], "via", self.allLayers, geom, rule.clearance,
                     width=rule.viaDia, pts=(p,), drill=rule.viaDrill, route=rid)
 
     def check(self, it, ignore=()):
@@ -1222,6 +1249,52 @@ class Router:
         out.sort(key=lambda e: e[0])
         return out
 
+    def viaOntoTrack(self, conn, res, runs, rule):
+        """A route that ends (or starts) with a via landing on another track of its net,
+        off that track's centreline: the via and the piece before it slide onto the
+        centreline (KiCad warns about a track that is not centred on a via)."""
+        runs = list(runs)
+        for end in (-1, 0):
+            if len(runs) < 2 or len(runs[end][1]) != 1 or (end == -1 and res["terminalVia"]):
+                continue
+            lyr, pts1, w1 = runs[end]
+            items = res["dstItems"] if end == -1 else res["srcItems"]
+            p = pts1[0]
+            owner = next((it for it in items if lyr in it.layers and it.kind == "track"
+                          and it.geom.buffer(1e-3).contains(Point(p))), None)
+            if owner is None:
+                continue
+            k = -2 if end == -1 else 1
+            lyr0, pts0, w0 = runs[k]
+            seq = pts0 if end == -1 else pts0[::-1]
+            moved = self.slideOnto(conn, lyr0, seq, owner, rule)
+            q = moved[-1]
+            if q == seq[-1] or self.check(self.viaItem(conn.net, q, rule, 0)):
+                continue
+            runs[k] = (lyr0, moved if end == -1 else moved[::-1], w0)
+            runs[end] = (lyr, [q], w1)
+        return runs
+
+    def slideOnto(self, conn, layer, pts, track, rule):
+        """A run that ends inside another track's copper but off its centreline (no leg
+        long enough fitted) is slid along its own last piece onto that centreline: KiCad
+        joins a track end to another track only there. Returns the points (unchanged when
+        the slid piece does not fit)."""
+        if len(pts) < 2:
+            return pts
+        p, prev = pts[-1], pts[-2]
+        if LineString(track.pts).distance(Point(p)) < 1e-4:
+            return pts
+        h = self.heading(prev, p)
+        best = None
+        for d, q in self.octilinearHits(prev, *track.pts):
+            if self.heading(prev, q) == h and (best is None or abs(math.dist(prev, q) - math.dist(prev, p))
+                                               < abs(math.dist(prev, best) - math.dist(prev, p))):
+                best = q
+        if best is None or math.dist(prev, best) < 1e-6 or not self.segOk(conn, layer, prev, best, rule.narrow, rule):
+            return pts
+        return pts[:-1] + [best]
+
     def entryLegs(self, conn, layer, p, items, rule):
         """Points that take a route end on to the centre of its pad (or the centreline of
         the track / the via it lands on), straight or with one bend, and the item it lands
@@ -1231,7 +1304,9 @@ class Router:
                 continue
             if it.kind == "pad":
                 c = it.pad.center
-                if c == p:
+                if c == p or not it.geom.contains(Point(c)):
+                    # already there, or a pad with no copper at its centre (a ring around a
+                    # microphone's sound port): the end stays where it landed, on the copper
                     return [], it
                 # the last leg along the pad's long axis, as a person draws it, at full
                 # width unless the pad is narrower than the track (then at the pad's width,
@@ -1282,6 +1357,7 @@ class Router:
     def buildItems(self, conn, res, rid):
         rule = res["rule"]
         runs, _ = self.pathToGeometry(conn, res)
+        runs = self.viaOntoTrack(conn, res, runs, rule)
         items = []
         tight = []
         for ri, (layer, pts, wide) in enumerate(runs):
@@ -1291,6 +1367,8 @@ class Router:
                 e, owner = self.entryLegs(conn, layer, pts[0], res["srcItems"], rule)
                 res["srcOwner"] = owner
                 onTrack[0] = owner is not None and owner.kind == "track"
+                if onTrack[0] and not e:
+                    pts = self.slideOnto(conn, layer, pts[::-1], owner, rule)[::-1]
                 pts = e[::-1] + pts
                 wide = [self.entryWide] * len(e) + wide
             if ri == len(runs) - 1 and not res["terminalVia"]:
@@ -1298,6 +1376,8 @@ class Router:
                 e, owner = self.entryLegs(conn, layer, pts[-1], res["dstItems"], rule)
                 res["dstOwner"] = owner
                 onTrack[1] = owner is not None and owner.kind == "track"
+                if onTrack[1] and not e:
+                    pts = self.slideOnto(conn, layer, pts, owner, rule)
                 pts = pts + e
                 wide = wide + [self.entryWide] * len(e)
             raw = list(pts)
@@ -1742,7 +1822,7 @@ class Router:
             nid = self.netId.get(net, HARD)
             cl = self.rules[net].clearance if net in self.rules else self.sp.defaultClearance
             uid = v[4] if len(v) > 4 else None
-            items.append(Item(0, nid, "via", tuple(range(NLAYERS)), Point(p).buffer(dia / 2 * CIRC, 16), cl,
+            items.append(Item(0, nid, "via", self.allLayers, Point(p).buffer(dia / 2 * CIRC, 16), cl,
                               width=dia, pts=(p,), drill=drill, tag="soft" if uid in soft else "existing"))
             items[-1].uuid = uid
         for it in items:
@@ -1989,14 +2069,32 @@ class Router:
                     v = via.pts[0]
                     if len(chain) == 1 and math.dist(end, ctr) < 1e-4 and self.octilinear(ctr, v):
                         continue
-                    other = B if layer == F else F
-                    tails = self.tracksAt(r, v, other)
-                    if any(len(self.tracksAt(r, v, other, {t.iid})) > 1 for t in tails):
+                    # the route carries on from the via on whichever layers it does (the
+                    # other outer layer, or an inner signal layer): each of those tails is
+                    # drawn again from the moved via on its own layer
+                    tails = [(t, l2) for l2 in self.allLayers if l2 != layer for t in self.tracksAt(r, v, l2)]
+                    if any(len(self.tracksAt(r, v, l2, {t.iid})) > 1 for t, l2 in tails):
                         continue
-                    if any(self.joinedByOthers(t, r) for t in tails):
+                    if any(self.joinedByOthers(t, r) for t, _ in tails):
                         continue
-                    farEnds = [t.pts[1] if math.dist(t.pts[0], v) < 1e-4 else t.pts[0] for t in tails]
-                    oldPieces = len(chain) + len(tails)
+                    # each tail as its chain of up to three unbranched pieces from the via, so
+                    # the moved via can join it further along instead of doubling back; the
+                    # chain stops before a piece other copper of the net touches
+                    tailChains = []
+                    for t, l2 in tails:
+                        pieces, pts, cur = [t], [v], v
+                        while True:
+                            last = pieces[-1]
+                            nxt = last.pts[1] if math.dist(last.pts[0], cur) < 1e-4 else last.pts[0]
+                            pts.append(nxt)
+                            cur = nxt
+                            more = self.tracksAt(r, cur, l2, {p.iid for p in pieces})
+                            if (len(pieces) >= 3 or len(more) != 1 or self.padUnder(c.net, l2, cur) is not None
+                                    or self.joinedByOthers(more[0], r)):
+                                break
+                            pieces.append(more[0])
+                        tailChains.append((l2, pieces, pts))
+                    oldPieces = len(chain) + sum(len(ps) for _, ps, _ in tailChains)
                     minx, miny, maxx, maxy = pad.poly.bounds
                     axis = ((1, 0), (-1, 0)) if maxx - minx >= maxy - miny else ((0, 1), (0, -1))
                     diag = ((1, 1), (1, -1), (-1, 1), (-1, -1))
@@ -2015,26 +2113,34 @@ class Router:
                             new = [self.viaItem(c.net, nv, rule, rid),
                                    self.trackItem(c.net, layer, ctr, nv, chain[0].width, rule.clearance, rid)]
                             ok = True
-                            for t, fe in zip(tails, farEnds):
-                                legs = None
-                                for corner in self.legs(nv, fe):
-                                    path = [nv, fe] if corner is None else [nv, corner, fe]
-                                    if all(a == b or not self.check(self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid),
-                                                                     ignore={via.iid, t.iid}) for a, b in zip(path, path[1:])):
-                                        legs = path
+                            dropped = []
+                            for l2, pieces, pts in tailChains:
+                                w = pieces[0].width
+                                ign = {via.iid} | {p.iid for p in pieces}
+                                found = None
+                                for j in range(len(pts) - 1, 0, -1):   # the farthest point first
+                                    for corner in self.legs(nv, pts[j]):
+                                        path = [nv, pts[j]] if corner is None else [nv, corner, pts[j]]
+                                        if all(a == b or not self.check(self.trackItem(c.net, l2, a, b, w, rule.clearance, rid),
+                                                                         ignore=ign) for a, b in zip(path, path[1:])):
+                                            found = (j, path)
+                                            break
+                                    if found:
                                         break
-                                if legs is None:
+                                if found is None:
                                     ok = False
                                     break
-                                new += [self.trackItem(c.net, other, a, b, t.width, rule.clearance, rid)
-                                        for a, b in zip(legs, legs[1:]) if a != b]
+                                j, path = found
+                                dropped += pieces[:j]
+                                new += [self.trackItem(c.net, l2, a, b, w, rule.clearance, rid)
+                                        for a, b in zip(path, path[1:]) if a != b]
                             if not ok or len(new) - 1 > oldPieces:
                                 continue
-                            ignore = {via.iid} | {t.iid for t in chain} | {t.iid for t in tails}
+                            ignore = {via.iid} | {t.iid for t in chain} | {p.iid for _, ps, _ in tailChains for p in ps}
                             if any(self.check(it, ignore=ignore) for it in new) or self.viaSpacing(new + [
                                     self.sp.items[i] for i in r.items if self.sp.items[i].kind == "via" and i != via.iid]):
                                 continue
-                            self.swapItems(r, [via] + chain + tails, new)
+                            self.swapItems(r, [via] + chain + dropped, new)
                             moved += 1
                             done = True
                             break

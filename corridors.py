@@ -13,7 +13,8 @@ two layers run crosswise: travelling along the other layer's diagonal costs extr
 long runs that head one way share a layer and cross the other layer's runs at right
 angles. Which layer gets which diagonal is planned both ways and the cheaper kept. The
 detailed router then pays extra to leave its group's corridor, and the corridor's layer
-replaces a per-bundle layer guess.
+replaces a per-bundle layer guess. On a board with inner signal layers the plan uses them
+too; each runs along its own main direction (horizontal or vertical, alternating).
 """
 import ctypes
 import math
@@ -23,8 +24,6 @@ import numpy as np
 
 from boardModel import B, F
 from native import edt
-
-LAYERS = (F, B)
 
 
 def octile(a, b):
@@ -84,6 +83,9 @@ class Corridors:
         self.T = self.s * sp.g
         self.TH = -(-sp.H // self.s)
         self.TW = -(-sp.W // self.s)
+        self.layers = list(router.signalLayers)     # stack order, F first and B last
+        self.index = {l: i for i, l in enumerate(self.layers)}
+        self.K = len(self.layers)
 
     # ---- capacity --------------------------------------------------------------------
     def capacity(self):
@@ -93,20 +95,20 @@ class Corridors:
         rule = r.rules[next(n for n, c in r.m.netClass.items() if c == "Default")]
         pitch = rule.width + rule.clearance
         need = rule.width / 2 + rule.clearance + k.margin
-        cap = np.zeros((2, self.TH, self.TW), np.float32)
-        for li, l in enumerate(LAYERS):
+        cap = np.zeros((self.K, self.TH, self.TW), np.float32)
+        for li, l in enumerate(self.layers):
             blocked = (sp.occ[l] != 0) | r.bodyKeep[l] | sp.trackKeep[l]
             free = edt(blocked) * sp.g >= need
             cap[li] = self.pool(free) * self.T / pitch
-        self.axisUse = np.zeros((2, self.TH, self.TW, 4), np.float32)
+        self.axisUse = np.zeros((self.K, self.TH, self.TW, 4), np.float32)
         for it in sp.items.values():
-            if it.kind != "track" or it.layers[0] not in LAYERS or it.net == r.netId.get("GND"):
+            if it.kind != "track" or it.layers[0] not in self.index or it.net == r.netId.get("GND"):
                 continue
             (x1, y1), (x2, y2) = it.pts
             L = math.hypot(x2 - x1, y2 - y1)
             if L < self.T / 2:
                 continue
-            li, a = LAYERS.index(it.layers[0]), axisOf(x2 - x1, y2 - y1)
+            li, a = self.index[it.layers[0]], axisOf(x2 - x1, y2 - y1)
             for t in {self.tileOf((x1 + (x2 - x1) * f, y1 + (y2 - y1) * f))
                       for f in np.linspace(0, 1, int(L / (self.T / 3)) + 2)}:
                 self.axisUse[(li, *t, a)] = max(self.axisUse[(li, *t, a)], 1.0)
@@ -129,7 +131,7 @@ class Corridors:
         out = set()
         for p in pads:
             ti, tj = self.tileOf(p.center)
-            for li, l in enumerate(LAYERS):
+            for li, l in enumerate(self.layers):
                 if l in p.layers:
                     out.add((li, ti, tj))
         return out
@@ -161,7 +163,7 @@ class Corridors:
         k = self.r.k
         idx = lambda li, ti, tj: (li * self.TH + ti) * self.TW + tj
         src = np.array([idx(*t) for t in g["src"]], np.int32)
-        tgt = np.zeros(2 * self.TH * self.TW, np.uint8)
+        tgt = np.zeros(self.K * self.TH * self.TW, np.uint8)
         for t in g["dst"]:
             tgt[idx(*t)] = 1
         c = cost.copy()
@@ -169,8 +171,8 @@ class Corridors:
             c[li, ti, tj] = min(c[li, ti, tj], 1.0)
         tis = [t[1] for t in g["dst"]]
         tjs = [t[2] for t in g["dst"]]
-        out = np.empty(4 * self.TH * self.TW + 16, np.int32)
-        n = self.r.kernel.astar(2, self.TH, self.TW, np.ascontiguousarray(c).ctypes.data,
+        out = np.empty(2 * self.K * self.TH * self.TW + 16, np.int32)
+        n = self.r.kernel.astar(self.K, self.TH, self.TW, np.ascontiguousarray(c).ctypes.data,
                                 self.viaok.ctypes.data, ctypes.c_float(k.corridorViaMm / self.T),
                                 tgt.ctypes.data, None, src.ctypes.data, len(src),
                                 ctypes.c_float(0.05), ctypes.c_float(0.25), ctypes.c_float(1.0),
@@ -196,21 +198,21 @@ class Corridors:
                 continue
             ax = axisOf(b[2] - a[2], b[1] - a[1])
             step = self.T * (math.sqrt(2) if ax in (1, 3) else 1.0)
-            mm += step * (1 + (k.againstCost if ax == 4 - mainAxis[a[0]] else 0.0))
+            mm += step * (1 + (k.againstCost if ax == (mainAxis[a[0]] + 2) % 4 else 0.0))
         return mm
 
     # ---- negotiation -----------------------------------------------------------------
     def negotiate(self, groups, mainAxis, iters):
-        """Corridors for all groups with the given main diagonal per layer (index 0 F,
-        1 B). Returns the groups with their paths and the plan's cost."""
+        """Corridors for all groups with the given main direction per signal layer (in the
+        order of self.layers). Returns the groups with their paths and the plan's cost."""
         k = self.r.k
         cap = self.cap
         hist = np.zeros_like(cap)
         use = np.zeros_like(cap)
         axisUse = self.axisUse.copy()
-        layerDir = np.zeros((2, 4), np.float32)
-        for li in range(2):
-            layerDir[li, 4 - mainAxis[li]] = k.againstCost
+        layerDir = np.zeros((self.K, 4), np.float32)
+        for li in range(self.K):
+            layerDir[li, (mainAxis[li] + 2) % 4] = k.againstCost
         gs = []
         for cs in groups:
             ends = [(c.a, c.b) for c in cs]
@@ -256,30 +258,41 @@ class Corridors:
         """Which diagonal each outer layer runs along, decided before anything is routed
         (power and long block wiring follow it too): every bundle is planned both ways
         on the bare board and the cheaper way is kept."""
-        names = {1: "\\", 3: "/"}
+        names = {0: "-", 1: "\\", 2: "|", 3: "/"}
+        full = lambda ax: tuple(ax[0] if l == F else ax[1] if l == B else self.r.mainAxis[l]
+                                for l in self.layers)
+        inner = "".join(f", {self.r.layerName(l)} {names[self.r.mainAxis[l]]}"
+                        for l in self.layers if l not in (F, B))
         forced = {"/": (3, 1), "\\": (1, 3)}.get(self.r.k.topDiagonal)
         if forced:
             mainAxis = forced
-            log(f"main diagonals: top {names[mainAxis[0]]}, bottom {names[mainAxis[1]]} (set)")
+            log(f"main directions: top {names[mainAxis[0]]}, bottom {names[mainAxis[1]]}{inner} (set)")
         else:
             self.cap = self.capacity()
-            costs = {ax: self.negotiate(groups, ax, iters)[1] for ax in ((3, 1), (1, 3))}
+            costs = {ax: self.negotiate(groups, full(ax), iters)[1] for ax in ((3, 1), (1, 3))}
             mainAxis = min(costs, key=costs.get)
-            log(f"main diagonals: top {names[mainAxis[0]]}, bottom {names[mainAxis[1]]} "
+            log(f"main directions: top {names[mainAxis[0]]}, bottom {names[mainAxis[1]]}{inner} "
                 f"(planned cost {costs[mainAxis]:.0f} vs {costs[mainAxis[::-1]]:.0f} mm)")
-        self.r.mainAxis = {F: mainAxis[0], B: mainAxis[1]}
+        self.r.mainAxis[F], self.r.mainAxis[B] = mainAxis
 
     def plan(self, groups, log, iters=15):
         """Plan every group's corridor on the board as routed so far."""
         self.cap = self.capacity()
-        mainAxis = (self.r.mainAxis[F], self.r.mainAxis[B])
+        mainAxis = tuple(self.r.mainAxis[l] for l in self.layers)
         gs, cost, st = self.negotiate(groups, mainAxis, iters)
         planned = [g for g in gs if g["path"]]
         nVia = sum(g["n"] * sum(1 for a, b in zip(g["path"], g["path"][1:]) if a[0] != b[0])
                    for g in planned)
-        onB = sum(g["n"] for g in planned if sum(t[0] for t in g["path"]) * 2 > len(g["path"]))
+        def mostly(g):
+            n = defaultdict(int)
+            for t in g["path"]:
+                n[t[0]] += 1
+            return self.layers[max(n, key=n.get)]
+        on = defaultdict(int)
+        for g in planned:
+            on[self.r.layerName(mostly(g))] += g["n"]
         log(f"corridors: {len(gs)} groups, {st['rounds']} rounds, {st['hot']} overfull tiles left, "
-            f"~{nVia} planned vias, {onB}/{sum(g['n'] for g in gs)} members mostly on bottom")
+            f"~{nVia} planned vias, members mostly on " + ", ".join(f"{n} {k}" for k, n in sorted(on.items())))
         for rank, g in enumerate(gs):
             mask = self.corridorMask(g)
             viaZone = self.viaZone(g)
@@ -293,7 +306,7 @@ class Corridors:
     def corridorMask(self, g):
         """Tiles of the path, one tile either side, both layers around layer changes, and
         the area around each end's pads."""
-        m = np.zeros((2, self.TH, self.TW), bool)
+        m = np.zeros((self.K, self.TH, self.TW), bool)
         if g["path"] is None:
             return None
         path = g["path"]
