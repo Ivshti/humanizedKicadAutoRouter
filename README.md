@@ -204,10 +204,12 @@ check the following.
 7. **Keep-out areas** you have drawn (board-level or inside footprints) are
    obeyed.
 8. **Antennas:** a footprint whose reference starts with `ANT` owns its whole
-   courtyard on its side of the board. No other copper goes under it.
+   courtyard on its side of the board. No other copper goes under it, and no
+   via goes through it.
 9. **Big modules and connectors** (courtyard of 40 mm² or more): no foreign
-   copper goes under their bodies on their side. Their own pins can still
-   escape outward.
+   track goes under their bodies on their side. Their own pins can still
+   escape outward. Vias may go under them wherever their pads leave room, as
+   designers place them; draw a keep-out zone where you want none.
 10. **Fiducials (`FID…`) and mounting holes (`H…`)** are left alone.
 11. **Differential pairs** are found by name: `X_DP`/`X_DN`, `X_P`/`X_N`,
     `X+`/`X-`, and `CANH`/`CANL`. The pair gap is the net class's diff-pair
@@ -421,8 +423,8 @@ Signal tracks use the width of your Default net class.
   main direction: the outer layers run opposite diagonals, and inner signal
   layers alternate horizontal and vertical, starting along the board's long
   side, so neighbouring signal layers cross at right angles.
-- No copper of another net under the antenna or under module and connector
-  bodies on their side.
+- No track of another net under the antenna or under module and connector
+  bodies on their side, and no via under the antenna.
 - No via touches any SMD pad, and a ground fanout via keeps 0.25 mm of bare
   board to every pad.
 - Nothing of another net crosses the path of a ground pad's thermal spokes, so
@@ -449,9 +451,12 @@ $KPY run.py myboard.kicad_pcb --out routed/ --keep-copper --route blocks --knob 
 - `--route blocks` routes only the short wiring inside each functional block
   (an IC or module with its passives) and the ground fanouts. The buses
   between blocks are left for you.
-- `--nets` limits the run to the nets you name.
+- `--nets` limits the run to the nets you name; the clean-up at the end then
+  touches only their copper. With `--keep-copper` it never touches yours.
 - With `--keep-copper`, ground is poured only on outer layers that have no
-  ground zone of your own; your zones and the new ones are stitched as above.
+  ground zone of your own. Return vias go only beside the vias this run
+  laid, and a piece of pour the new tracks cut off gets its two vias, but
+  open pour gets no new grid of stitching vias: that is yours.
   Pairs that already have copper of yours are not length-matched.
 - Copper of yours that no longer touches any pad of its net (after you moved
   a part) is listed in the log; `--drop-stale` removes it, so the router does

@@ -472,6 +472,12 @@ def fixStarvedThermals(board, drc):
     return n
 
 
+def gndMissed(drc):
+    """GND pads KiCad's DRC reports apart from the rest of ground: ["REF.pad", ...]."""
+    return sorted({m.group(2) + "." + m.group(1) for u in drc["unconnected_items"] for it in u["items"]
+                   for m in [re.search(r"[Pp]ad (\S+) \[GND\] of (\S+)", it["description"])] if m})
+
+
 def stitchPours(board, router, conns, net="GND", openPour=True):
     """Stitch the outer pours of `net` (filled, islands kept) to the plane: every piece
     gets stitchPerIsland vias or through-hole pads of the net, so none is fed only through
@@ -912,9 +918,10 @@ def main():
         if powerCopper(router, model, log):
             audit(router, log, "power copper")
     if "GND" in router.planeNets and router.k.stitch:
-        log(f"return vias: {router.returnVias()} GND vias beside signal vias")
+        # a routing run stitches around its own vias; --stitch-only around everyone's
+        log(f"return vias: {router.returnVias(ownOnly=not args.stitch_only)} GND vias beside signal vias")
     finish = lambda: finishBoard(board, router, model, keepZones, conns, keepTracks - router.droppedUuids,
-                                 not boardZones, log, openPour=not args.keep_copper)
+                                 not boardZones, log, openPour=args.stitch_only or not args.keep_copper)
     nT, nV, nIsl, islandPads = finish()
     board.Save(outBoard)
     log(f"wrote {outBoard}: {nT} tracks, {nV} vias")
@@ -966,10 +973,8 @@ def main():
         board.Save(outBoard)
         log(f"thermals: {solid} GND pads switched to solid pour connection")
         drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
-    missed = sorted({m.group(2) + "." + m.group(1) for u in drc["unconnected_items"] for it in u["items"]
-                     for m in [re.search(r"[Pp]ad (\S+) \[GND\] of (\S+)", it["description"])] if m})
-    if missed:
-        log(f"GND pads the pour does not reach: {', '.join(missed)}")
+    if gndMissed(drc):
+        log(f"GND pads the pour does not reach: {', '.join(gndMissed(drc))}")
     if args.tidy != "off":
         judge = Judge(os.path.join(args.out, "tidy"), name, os.path.join(srcDir, name + ".kicad_pro"),
                       os.path.join(srcDir, name + ".kicad_dru"))
@@ -982,6 +987,8 @@ def main():
             drc = runDrc(outBoard, os.path.join(args.out, "drc.json"))
     viol = Counter(v["type"] for v in drc["violations"])
     log(f"DRC: {sum(viol.values())} violations {dict(viol)}, {len(drc['unconnected_items'])} unconnected")
+    if gndMissed(drc):   # judged on the board as written, after the clean-up
+        log(f"WARNING GND pads cut off from ground on the finished board: {', '.join(gndMissed(drc))}")
     if flows:
         want = lambda net, amps: max(router.rules[net].width, ipcWidth(amps, router.k),
                                      router.flowFloor.get(net, 0.0))

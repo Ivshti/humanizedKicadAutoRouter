@@ -476,8 +476,11 @@ class Router:
         return mask
 
     def loadStrategyRasters(self):
-        """Human conventions as rasters: no foreign copper under module/antenna bodies,
-        keep GND thermal spokes free, and a static distance-to-hole field."""
+        """Human conventions as rasters: no foreign track under module/antenna bodies on
+        their own side and no via under an antenna (a via under a module is fine wherever
+        its pads leave room: designers put them there, and mark the places they do not
+        want one with a keep-out zone), keep GND thermal spokes free, and a static
+        distance-to-hole field."""
         sp, k = self.sp, self.k
         self.bodyKeep = np.zeros((self.NL, sp.H, sp.W), bool)
         self.bodyViaKeep = np.zeros((sp.H, sp.W), bool)
@@ -486,7 +489,8 @@ class Router:
             crt = fp.courtyard
             if crt is None or crt.is_empty:
                 continue
-            if fp.ref.startswith("ANT"):
+            antenna = fp.ref.startswith("ANT")
+            if antenna:
                 body = crt                      # the antenna owns its whole courtyard
             elif crt.area >= k.bodyMinAreaMm2:
                 body = crt.buffer(-1.0)         # under a module/connector body
@@ -498,7 +502,8 @@ class Router:
             win, mask = sp.rasterMask(body)
             i0, j0, i1, j1 = win
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
-            self.bodyViaKeep[i0:i1, j0:j1] |= mask
+            if antenna:
+                self.bodyViaKeep[i0:i1, j0:j1] |= mask
         self.jumpChannels = self.findJumpChannels() if k.jumps else []
         self.thermalCost = np.zeros((self.NL, sp.H, sp.W), np.float32)
         for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
@@ -3686,17 +3691,18 @@ class Router:
         ii, jj, d = ii[keep], jj[keep], d[keep]
         return [sp.toMm(ii[x] + a0, jj[x] + b0) for x in np.argsort(d)[:n]]
 
-    def returnVias(self, net="GND", reach=1.5, placeMm=2.0):
-        """A plane via next to every signal via this run laid that has none within reach
-        (placed within placeMm, as near as the pad gap allows): the return current of a
-        track that changes layers changes planes there too. The designer's vias are theirs."""
+    def returnVias(self, net="GND", reach=1.5, placeMm=2.0, ownOnly=True):
+        """A plane via next to every signal via that has none within reach (placed within
+        placeMm, as near as the pad gap allows): the return current of a track that changes
+        layers changes planes there too. ownOnly: only beside the vias this run laid (the
+        designer's vias are theirs)."""
         sp = self.sp
         ok = self.stitchMask(net)
         nid = self.netId[net]
         gnd = [it.pts[0] for it in sp.items.values() if it.kind == "via" and it.net == nid]
         added = 0
         for it in list(sp.items.values()):
-            if it.kind != "via" or it.net == nid or it.route not in self.routes:
+            if it.kind != "via" or it.net == nid or (ownOnly and it.route not in self.routes):
                 continue
             x, y = it.pts[0]
             if any(math.dist(g, (x, y)) <= reach for g in gnd):
