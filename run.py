@@ -102,6 +102,23 @@ def negotiate(router, queue, log, maxRounds=40, deadline=None, winPads=None):
                 router.commit(c, res, items)
             # a ripped stitching via is not put back: the field has vias to spare
             queue += [r for r in ripped if r is not c and r.kind != "stitch"]
+        elif st == "nudge":
+            # only the designer's copper is in the way: nudge it aside (Router.nudge), the
+            # routes in the way as well ripped and queued again as for a conflict
+            res, items, victims, pieces = payload
+            ripped = []
+            for v in victims:
+                router.rip(v, ripped)
+
+            def place(c=c, res=res, items=items):
+                if any(o.route not in pieces for it in items for o in router.check(it)):
+                    return None
+                router.commit(c, res, items)
+                return [c.rid]
+            if not router.nudge(pieces, place, log):
+                router.nudgeRefused.add((c.cid, frozenset(pieces)))
+                queue.append(c)
+            queue += [r for r in ripped if r is not c and r.kind != "stitch"]
         elif st != "ok":
             queue.append(c)
     return rounds
@@ -303,6 +320,34 @@ def repairUnreached(board, router, conns, log):
         fanout.append(c)
     log("pads the pour does not reach: " + (", ".join(f"{n} {how}" for how, n in done.items()) or "none"))
     return fanout, solid
+
+
+def repairMissedGnd(board, router, missed, log):
+    """GND pads the pour misses under fanoutParts "none". gndRepair "report": listed for the
+    designer, no copper added; "join": repairUnreached ties them. Returns (connections left
+    for push and shove, pads switched to solid)."""
+    if router.k.gndRepair == "join":
+        return repairUnreached(board, router, missed, log)
+    if missed:
+        log("pads the pour does not reach, left to the designer: "
+            + ", ".join(sorted(f"{c.a.ref}.{c.a.num}" for c in missed)))
+    return [], 0
+
+
+def powerCopper(router, model, log):
+    """Power tracks keep the width their class (or their --flows current) sets; with the
+    fatten knob each is widened to the widest that fits (Router.fatten). Returns how many
+    tracks were widened."""
+    if not router.k.fatten:
+        log("power copper: class widths (fatten off)")
+        return 0
+    # a net the designer put in the Rail class is a light rail (a backlight cathode, a
+    # reference): it keeps its class width unless a flow says it carries current
+    powerNets = {n for n in model.netClass if router.powerClass(n) and model.netClass[n] != "Rail"} \
+        | router.flowNets
+    n = router.fatten(powerNets)
+    log(f"power copper: {n} tracks widened")
+    return n
 
 
 SIDECAR = ".humanrouter.json"   # next to a board: the copper the router drew on it
@@ -703,6 +748,8 @@ def main():
         cur = getattr(knobs, key)
         setattr(knobs, key, (value.lower() in ("1", "true", "yes")) if isinstance(cur, bool) else type(cur)(value))
         log(f"knob {key} = {getattr(knobs, key)}")
+    if knobs.gndRepair not in ("report", "join"):
+        raise SystemExit(f"gndRepair must be 'report' or 'join', not {knobs.gndRepair!r}")
     knobs.seed = args.seed or knobs.seed
     router = Router(model, knobs, log)
     courtyards = readCourtyardClearances(os.path.join(srcDir, name + ".kicad_dru"))
@@ -772,6 +819,8 @@ def main():
     conns, block, bundles = plan(model, router, log, flows)
     router.allConns = conns
     router.inputNets = {c.net for c in conns if c.input}
+    if router.k.nudge:
+        log(f"nudge: {router.markMovable()} pieces of the designer's copper may be nudged aside")
     total = len(conns)
     if args.route == "blocks":
         conns = [c for c in conns if c.kind == "gnd" or not c.bundle]
@@ -826,12 +875,8 @@ def main():
             else:
                 viaBy[c.kind] += n
         log(f"vias by kind: {dict(viaBy)}")
-        # a net the designer put in the Rail class is a light rail (a backlight cathode, a
-        # reference): it keeps its class width unless a flow says it carries current
-        powerNets = {n for n in model.netClass if router.powerClass(n) and model.netClass[n] != "Rail"} \
-            | router.flowNets
-        log(f"power copper: {router.fatten(powerNets)} tracks widened")
-        audit(router, log, "power copper")
+        if powerCopper(router, model, log):
+            audit(router, log, "power copper")
     if "GND" in router.planeNets and router.k.stitch:
         log(f"return vias: {router.returnVias()} GND vias beside signal vias")
     finish = lambda: finishBoard(board, router, model, keepZones, conns, keepTracks - router.droppedUuids,
@@ -858,10 +903,10 @@ def main():
                 f"({len(ripped)} connections with them)")
             stranded += [c for c in offPlane + ripped if c not in stranded]
         if router.k.fanoutParts == "none":
-            # those pads take the pour by design; one it misses is joined to the pour,
-            # not given a via beside it unless nothing else works
+            # those pads take the pour by design; one it misses is reported, or with
+            # gndRepair "join" joined to the pour (a via beside it only if nothing else works)
             missed = [c for c in stranded if c.deferred]
-            fan, solid = repairUnreached(board, router, missed, log)
+            fan, solid = repairMissedGnd(board, router, missed, log)
             stranded = [c for c in stranded if not c.deferred] + fan
             repaired = [c for c in missed if router.connected(c)]
         else:

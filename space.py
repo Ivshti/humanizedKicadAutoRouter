@@ -129,8 +129,14 @@ class Space:
     def remove(self, iid):
         item = self.items.pop(iid)
         self.index(item, False)
+        # copper stamped fixed (pads, holes, the board's own copper) leaves the fixed raster
+        # too: a lifted piece of the designer's copper must not stay a wall
+        fixed = item.kind in ("pad", "hole") or item.tag == "existing"
         for (l, win, mask) in item.stamped:
             i0, j0, i1, j1 = win
+            if fixed:
+                fsub = self.fixed[l, i0:i1, j0:j1]
+                fsub[mask & (fsub == item.net)] = 0
             sub = self.occ[l, i0:i1, j0:j1]
             sub[mask & (sub == item.net)] = 0
             self.fine[l, i0:i1, j0:j1][mask & (sub == 0)] = False

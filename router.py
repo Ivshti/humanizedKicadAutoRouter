@@ -37,6 +37,11 @@ class Knobs:
     seed: int = 0                # 0: the routing order as planned; another: each connection's
                                  # place in it shaken a little (reproducibly), to try other orders
     powerWidth: dict = field(default_factory=lambda: {"Power": 0.5, "Rail": 0.3})
+    fatten: bool = False         # power copper widened to the widest that fits (2 mm down to
+                                 # 0.6 mm, capped by the pads it lands on), so a net's tracks
+                                 # overlap into a small pour. Off: a power track keeps its class
+                                 # width, or the width its --flows current needs (the Ambire
+                                 # signer's owner, 2026-10-23: "random slabs of thick trace")
     turn45Mm: float = 0.1
     turn90Mm: float = 0.5
     viaMm: float = 5.0
@@ -55,6 +60,12 @@ class Knobs:
     thermalHard: bool = True     # other nets may not cross those corridors at all (except
                                  # within 0.3 mm of their own pads, to get out of a pin row)
     fanoutViaGapMm: float = 0.25 # bare board between a GND fanout via's ring and any pad edge
+    viaPadGapMm: float = 0.2     # bare board between any via's ring and any pad edge, its own
+                                 # net's too (a via crowding a pad, or in it, reads as a defect:
+                                 # the Ambire signer's owner, 2026-10-25); GND fanouts use
+                                 # fanoutViaGapMm
+    hopMaxMm: float = 6.0        # a route that drops a layer and comes straight back within
+                                 # this much is laid on its own layer when that fits (was 1 mm)
     fanoutInsideMult: float = 3.0  # a fanout pays this much more where its via does not belong:
                                  # inside a small part's outline (via on the far side), or just
                                  # outside a chip's pin ring (via inside the ring, under the body)
@@ -64,10 +75,26 @@ class Knobs:
                                  # via only if the pour misses them; "none" = every pad takes
                                  # the pour, stitching feeds it and a pad it misses is reported.
                                  # Pads of plane nets with no outer pour always get their via.
+    gndRepair: str = "report"    # under fanoutParts "none", a GND pad the pour misses after
+                                 # routing: "report" lists it and adds no copper (the designer
+                                 # decides; the Ambire signer's owner, 2026-10-23: router GND
+                                 # tracks are slop); "join" ties it: a track to the pour, a via
+                                 # in an exposed pad or a chip's pin ring, a via beside it last
     blockLayer: str = "free"     # "own": wiring inside a block stays on its parts' layer, the
                                  # other outer layer is left to the bundles (relaxed only for a
                                  # connection that cannot be routed that way)
     bodyMinAreaMm2: float = 40.0
+    jumps: bool = True           # a signal may pass under a two-pad part (an 0402 resistor),
+                                 # straight between its pads, at exact clearance: a person's
+                                 # "jump" (the Ambire signer's owner, 2026-10-23)
+    jumpMult: float = 1.3        # cost of a cell in such a jump channel
+    nudge: bool = False          # the designer's copper may be nudged aside, the way a person
+                                 # makes room: a blocking piece is lifted, the blocked route laid,
+                                 # and the piece laid again along its old path (Router.nudge)
+    nudgeLenSlack: float = 1.3   # a nudged piece may grow to this much of its length ...
+    nudgeLenAddMm: float = 1.0   # ... plus this, on its own layers, with no more vias
+    nudgeHug: float = 0.25       # cost of a cell near the piece's old path, while re-laying it
+    nudgeMaxPieces: int = 3      # most pieces one route or pair may nudge
     stitchPitchMm: float = 4.0
     stitch: bool = True          # stitch the outer ground pours to the plane after routing
     stitchPadGapMm: float = 0.5  # bare board between a stitching or return via and any pad
@@ -153,6 +180,7 @@ class Conn:
     pairLeader: object = None # set on a pair's second net: the first net's connection
     pairMate: object = None   # both nets of a pair: the other one's connection
     pairTried: bool = False   # the pair was already tried together (see Router.routePair)
+    pairNudgeTried: bool = False  # ... and with the designer's copper movable (Router.routePairNudged)
     escapes: object = None    # a pair's reserved escapes (see reserveEscapes)
     deferred: bool = False    # a GND fanout left to the pour unless the pour misses the pad
     layerLock: int = -1       # the only layer this connection may use (-1: any)
@@ -217,6 +245,10 @@ class Router:
         self.existingItems = {}    # rid (< 0) -> its items
         self.softPieces = set()    # rids of existing pieces an earlier router run drew
         self.droppedUuids = set()  # board items of soft pieces ripped this run
+        self.nudgeAttract = {}     # net -> [(layers, geom)]: the old path a nudged piece is re-laid along
+        self.nudged = []           # nets of the designer's copper nudged aside this run
+        self.nudgeRefused = set()  # (connection id, pieces) whose nudge did not hold: not tried again
+        self.movable = False       # set during a pair search that may pass the designer's copper
         self.allConns = []         # every planned connection (a ripped soft piece's are re-queued)
         self.padsOfRef = {}
         for pad in model.pads:
@@ -361,6 +393,68 @@ class Router:
                 self.ruleAreas[i0:i1, j0:j1] |= mask
         self.loadStrategyRasters()
 
+    def findJumpChannels(self):
+        """Gaps a signal may cross under a two-pad SMD part (resistor, capacitor): the
+        straight line midway between the pads' facing edges, across the pads' common
+        width plus a lead-in at each end. A person routes a 0.15 mm track under an 0402
+        (0.48 mm between its pads) with 0.165 mm either side: legal at the design
+        clearance, but not with the search's safety margin on top, so these channels are
+        judged at exact clearance, one grid column wide. Only parts square to the grid:
+        a column of cell centres then lies within half a cell of the line."""
+        out = []
+        for fp in self.m.footprints.values():
+            pads = fp.pads
+            if len(pads) != 2 or not all(p.smd for p in pads):
+                continue
+            a, b = pads
+            layers = [l for l in a.layers if l in (F, B) and l in b.layers]
+            if not layers:
+                continue
+            (ax, ay), (bx, by) = a.center, b.center
+            dx, dy = bx - ax, by - ay
+            L = math.hypot(dx, dy)
+            if L < 1e-6 or min(abs(dx), abs(dy)) > 1e-3:   # not square to the grid
+                continue
+            ux, uy = dx / L, dy / L                         # pad to pad
+            vx, vy = -uy, ux                                # across the gap
+            pa = [((x - ax) * ux + (y - ay) * uy, (x - ax) * vx + (y - ay) * vy) for x, y in a.poly.exterior.coords]
+            pb = [((x - ax) * ux + (y - ay) * uy, (x - ax) * vx + (y - ay) * vy) for x, y in b.poly.exterior.coords]
+            s1, s2 = max(u for u, _ in pa), min(u for u, _ in pb)
+            v0 = max(min(v for _, v in pa), min(v for _, v in pb))
+            v1 = min(max(v for _, v in pa), max(v for _, v in pb))
+            if s2 - s1 <= 0 or v1 <= v0:
+                continue
+            uc = (s1 + s2) / 2
+            out.append(dict(ref=fp.ref, layers=layers, gap=s2 - s1, nets={a.net, b.net},
+                            pads=(a, b), origin=(ax, ay), u=(ux, uy), v=(vx, vy), uc=uc, v0=v0, v1=v1))
+        return out
+
+    def jumpMask(self, conn, rule, l, win):
+        """Cells of the jump channels this connection may use on layer l, within win."""
+        i0, j0, i1, j1 = win
+        mask = np.zeros((i1 - i0, j1 - j0), bool)
+        if conn.kind != "sig":
+            return mask
+        for jc in self.jumpChannels:
+            if l not in jc["layers"] or conn.net in jc["nets"]:
+                continue
+            clr = max([rule.clearance] + [self.rules[n].clearance if n in self.rules else self.sp.defaultClearance
+                                          for n in jc["nets"]])
+            slack = jc["gap"] / 2 - rule.width / 2 - clr
+            if slack < 0:
+                continue
+            ax, ay = jc["origin"]
+            (ux, uy), (vx, vy) = jc["u"], jc["v"]
+            lead = rule.width / 2 + clr + self.k.margin      # out past the pads' ends
+            p = lambda vv: (ax + jc["uc"] * ux + vv * vx, ay + jc["uc"] * uy + vv * vy)
+            cwin, cells = self.sp.segMask(p(jc["v0"] - lead), p(jc["v1"] + lead), slack)
+            c0, d0 = max(cwin[0], i0), max(cwin[1], j0)
+            c1, d1 = min(cwin[2], i1), min(cwin[3], j1)
+            if c1 <= c0 or d1 <= d0:
+                continue
+            mask[c0 - i0:c1 - i0, d0 - j0:d1 - j0] |= cells[c0 - cwin[0]:c1 - cwin[0], d0 - cwin[1]:d1 - cwin[1]]
+        return mask
+
     def loadStrategyRasters(self):
         """Human conventions as rasters: no foreign copper under module/antenna bodies,
         keep GND thermal spokes free, and a static distance-to-hole field."""
@@ -385,6 +479,7 @@ class Router:
             i0, j0, i1, j1 = win
             self.bodyKeep[fp.side, i0:i1, j0:j1] |= mask
             self.bodyViaKeep[i0:i1, j0:j1] |= mask
+        self.jumpChannels = self.findJumpChannels() if k.jumps else []
         self.thermalCost = np.zeros((NLAYERS, sp.H, sp.W), np.float32)
         for pad in self.m.nets.get("GND", []) if "GND" in self.planeNets else []:
             if not pad.smd:
@@ -547,6 +642,12 @@ class Router:
                 soft = okFix & ~ok
                 ok = okFix
                 wideOk[li] = dFix >= rW
+            jump = self.jumpMask(conn, rule, l, win) if self.jumpChannels else None
+            if jump is not None and jump.any():
+                # a jump: the two pads it passes are rasterised, so they read up to a cell
+                # nearer than they are; anything else must still clear the full rule
+                d = dFix if negotiate else dAll
+                ok |= jump & (d >= rule.width / 2 + rule.clearance - g)
             ok &= ~sp.trackKeep[l, i0:i1, j0:j1]
             front = np.zeros((h, w), bool)
             for fl, cells in self.frontsIn(win):
@@ -576,6 +677,19 @@ class Router:
                 c[~inside & ~escape] *= k.corridorOut
             if soft is not None:
                 c[soft] *= (1.0 + k.negotiatePenalty)
+            if jump is not None and jump.any():
+                c[jump] *= k.jumpMult
+            old = self.nudgeAttract.get(conn.net)
+            if old:
+                near = np.zeros((h, w), bool)
+                for lays, geom in old:
+                    if l not in lays:
+                        continue
+                    aw, am = sp.rasterMask(geom, 0.35)
+                    c0, d0, c1, d1 = max(aw[0], i0), max(aw[1], j0), min(aw[2], i1), min(aw[3], j1)
+                    if c1 > c0 and d1 > d0:
+                        near[c0 - i0:c1 - i0, d0 - j0:d1 - j0] |= am[c0 - aw[0]:c1 - aw[0], d0 - aw[1]:d1 - aw[1]]
+                c[near] *= k.nudgeHug
             c[~ok] = -1
             cost[li] = c
         # own pad interiors: always enterable by a track that stays inside the pad
@@ -607,6 +721,8 @@ class Router:
             viaok &= ~(self.bodyViaKeep[i0:i1, j0:j1] & ~escape)
         # one cell of raster slack: a pad corner can rasterise one cell short
         viaok &= sp.maskDist(sp.smdPad, win, pred=lambda a: np.isin(a, nets)) >= rv + 0.03 + g * math.sqrt(2) + extraMargin
+        if k.viaPadGapMm > 0:
+            viaok &= self.padEdgeDist[i0:i1, j0:j1] >= rv + k.viaPadGapMm + g
         viaok &= self.holeDist[i0:i1, j0:j1] >= rule.viaDrill / 2 + self.m.minHoleToHole + m
         viaok &= sp.maskDist(sp.viaAt, win, pred=lambda a: np.isin(a, nets)) >= \
             rule.viaDrill + self.m.minHoleToHole + m
@@ -1230,14 +1346,14 @@ class Router:
 
         def clean(pts):
             return all(self.octilinear(a, b) and math.dist(a, b) > 1e-6 for a, b in zip(pts, pts[1:]))
-        # a hop: down a layer and back up within a millimetre, where staying would do
+        # a hop: down a layer and back up within hopMaxMm, where staying would do
         k = 0
         while k + 2 < len(tight):
             la, A, wa = tight[k]
             lm, Mp, wm = tight[k + 1]
             lc, C, wc = tight[k + 2]
             hop = sum(math.dist(a, b) for a, b in zip(Mp, Mp[1:]))
-            if la == lc and A and C and hop < 1.0:
+            if la == lc and A and C and hop < self.k.hopMaxMm:
                 P, Q = A[-1], C[0]
                 link = None
                 for corner in self.legs(P, Q):
@@ -1693,6 +1809,108 @@ class Router:
         return [rid for rid, (net, nodes) in self.existing.items()
                 if net not in self.outerPourNets and not any(n[0] == "pad" for n in nodes)]
 
+    def blocking(self, it):
+        """check(it), less the designer's copper a movable pair attempt may nudge aside."""
+        hits = self.check(it)
+        if self.movable:
+            hits = [o for o in hits if not (o.kind in ("track", "via") and o.route < 0 and self.nudgeable(o.route))]
+        return hits
+
+    def nudgeable(self, rid):
+        """A piece of the designer's copper the router may nudge aside: a signal's track
+        from one pad to another, nothing of the router's hanging off it, not half of a
+        differential pair (its partner would be left behind)."""
+        if rid >= 0 or rid in self.softPieces or rid not in self.existing or self.children.get(rid):
+            return False
+        net, nodes = self.existing[rid]
+        if net in self.planeNets or net in self.outerPourNets or self.powerClass(net):
+            return False
+        if any(c.net == net and c.pairMate is not None for c in self.allConns):
+            return False
+        return len(nodes) == 2 and all(n[0] == "pad" for n in nodes)
+
+    def markMovable(self):
+        """With the nudge knob: the designer's pieces that may be nudged are stamped like an
+        earlier run's copper (negotiation may pass them at a price) instead of fixed. Call
+        after planning (nudgeable needs the planned pairs). Returns how many."""
+        n = 0
+        for rid in list(self.existingItems):
+            if not self.nudgeable(rid):
+                continue
+            items = self.existingItems[rid]
+            for it in items:
+                self.sp.remove(it.iid)
+                self.netItems.get(it.net, set()).discard(it.iid)
+                it.tag, it.stamped = "movable", []
+                self.sp.add(it)
+                self.netItems.setdefault(it.net, set()).add(it.iid)
+            n += 1
+        return n
+
+    def nudge(self, pieces, place, log):
+        """Make way through the designer's copper the way a person nudges a trace aside.
+        The pieces are lifted, place() lays the blocked route(s) (it returns their rids, or
+        None), and each piece's connection is laid again with its old path made cheap. The
+        nudge holds only if every piece comes back on its own layers, with no more vias and
+        within nudgeLenSlack x its length + nudgeLenAddMm; otherwise everything is put back
+        as it was. True when it holds."""
+        k = self.k
+        snap = {rid: (*self.existing[rid], list(self.existingItems[rid])) for rid in pieces}
+        freed = {}
+        for rid in pieces:
+            self.softPieces.add(rid)            # lifted like an earlier run's copper
+            freed[rid] = self.ripSoft(rid, [])
+        placed = place()
+        laid, why = [], ""
+        ok = placed is not None
+        if not ok:
+            why = "the blocked route did not lay"
+        for rid, (net, nodes, items) in snap.items():
+            if not ok:
+                break
+            old = sum(math.dist(*it.pts) for it in items if it.kind == "track")
+            oldVias = sum(1 for it in items if it.kind == "via")
+            layers = sorted({l for it in items if it.kind == "track" for l in it.layers})
+            self.nudgeAttract[net] = [(it.layers, it.geom) for it in items]
+            try:
+                for c in freed[rid]:
+                    st, _ = self.route(c, layers, (2.0, 6.0))
+                    if st != "ok" or not self.connected(c):
+                        ok, why = False, f"{net} could not be laid again"
+                        break
+                    if c.rid in self.routes:
+                        laid.append(c.rid)
+            finally:
+                self.nudgeAttract.pop(net, None)
+            if not ok:
+                break
+            new = [self.sp.items[i] for c in freed[rid] if c.rid in self.routes for i in self.routes[c.rid].items]
+            length = sum(math.dist(*it.pts) for it in new if it.kind == "track")
+            vias = sum(1 for it in new if it.kind == "via")
+            if length > old * k.nudgeLenSlack + k.nudgeLenAddMm or vias > oldVias or \
+                    not {l for it in new if it.kind == "track" for l in it.layers} <= set(layers):
+                ok, why = False, f"{net} would come back {length:.1f} mm / {vias} vias (was {old:.1f} / {oldVias})"
+        if ok:
+            self.nudged += [snap[rid][0] for rid in pieces]
+            log(f"nudge: {', '.join(snap[rid][0] for rid in pieces)} moved aside")
+            return True
+        for rid in laid + list(placed or []):
+            self.rip(rid)
+        for rid, (net, nodes, items) in snap.items():
+            for it in items:
+                it.stamped = []
+                it.route = rid
+                self.sp.add(it)
+                self.netItems.setdefault(it.net, set()).add(it.iid)
+                self.droppedUuids.discard(it.uuid)
+            self.existing[rid] = (net, nodes)
+            self.existingItems[rid] = items
+            self.softPieces.discard(rid)
+            for c in freed[rid]:
+                c.routed = True
+        log(f"nudge: not taken ({why})")
+        return False
+
     def dropExisting(self, rid):
         """Take a piece of existing copper out of the model; returns its board uuids."""
         uuids = set()
@@ -1917,7 +2135,7 @@ class Router:
                      for p in (padL, padF)}
             items = {n: [self.escapeItem(n, layer, a, b, rule) for a, b in zip(q, q[1:])]
                      for n, q in paths.items()}
-            if any(self.check(it) for its in items.values() for it in its) \
+            if any(self.blocking(it) for its in items.values() for it in its) \
                     or not self.pairClear(items[padL.net], items[padF.net]):
                 continue
             ends = [q[-1] for q in paths.values()]
@@ -2089,7 +2307,7 @@ class Router:
                  inner.net: [I, G, (O[0] + s[0] * half + u[0] * reach, O[1] + s[1] * half + u[1] * reach)]}
         items = {n: [self.escapeItem(n, layer, a, b, rule) for a, b in zip(p, p[1:])]
                  for n, p in paths.items()}
-        hits = [o for its in items.values() for it in its for o in self.check(it)]
+        hits = [o for its in items.values() for it in its for o in self.blocking(it)]
         if hits or not self.pairClear(items[outer.net], items[inner.net]):
             what = ", ".join(sorted({f"{self.netName.get(o.net, 'no net')} {o.kind}"
                                      + (f" {o.pad.ref}.{o.pad.num}" if o.kind == "pad" else "")
@@ -2145,7 +2363,7 @@ class Router:
         win = sp.winFor((min(xs), min(ys), max(xs), max(ys)), winPad)
         # the centreline keeps clear of everything, the four pads included: each track
         # leaves its pad on its own legs, so the pair never runs along a partner's pad
-        cost, viaok, wideOk, _ = self.buildCost(lead, crule, win, layers, [], [], False, extraMargin,
+        cost, viaok, wideOk, _ = self.buildCost(lead, crule, win, layers, [], [], self.movable, extraMargin,
                                                       ownNets=(-1,), ownPads=srcItems + dstItems)
         i0, j0, i1, j1 = win
         cy, cx = sp.cellCenters(win)
@@ -2190,7 +2408,7 @@ class Router:
             need = half + rule.width / 2 + rule.clearance + 2 * k.grid
             for li, l in enumerate(layers):
                 if all(l in it.layers for it in items):
-                    m[li] = disk & (self.clearDist(0, l, win, rule.clearance, nets=(-1,)) >= need)
+                    m[li] = disk & (self.clearDist(0, l, win, rule.clearance, fixedOnly=self.movable, nets=(-1,)) >= need)
             stages.append(int(m.sum()))
             m &= cost >= 0
             stages.append(int(m.sum()))
@@ -2520,6 +2738,12 @@ class Router:
             return None
         itemsA, itemsB = laid
         bad = [it for it in itemsA + itemsB if self.check(it)]
+        if self.movable and bad:
+            # a movable search may run through the designer's copper: those pieces are its
+            # price (nudged aside by the caller); anything else still fails the pair
+            hit = [o for it in bad for o in self.check(it)]
+            if all(o.kind in ("track", "via") and o.route < 0 and self.nudgeable(o.route) for o in hit):
+                bad = []
         if bad or self.viaSpacing(itemsA) or self.viaSpacing(itemsB) or not self.pairClear(itemsA, itemsB):
             if os.environ.get("HR_TRACE_PAIR"):
                 close = [(round(a.geom.distance(b.geom), 3), a.pts, b.pts) for a in itemsA for b in itemsB
@@ -2541,6 +2765,16 @@ class Router:
                 or lead.pairTried:
             return False
         lead.pairTried = follow.pairTried = True
+        laid = self.layPairEscaped(lead, follow, layers, winPads, viaMm)
+        if laid is None:
+            return False
+        self.commitPair(lead, laid[0])
+        self.commitPair(follow, laid[1])
+        return True
+
+    def layPairEscaped(self, lead, follow, layers, winPads, viaMm):
+        """Both nets' items for a pair, out of its pins first where they need it (a BGA's
+        balls, a row of pins), or None; nothing is committed."""
         holder = lead if lead.escapes is not None else follow if follow.escapes is not None else None
         reserved = holder is not None
         if holder is not None:
@@ -2584,11 +2818,34 @@ class Router:
                 at = ", ".join(sorted({(lead.a if end == 0 else lead.b).ref for end in esc}))
                 self.log(f"pair {lead.net}/{follow.net}: escaped the pins of {at}"
                          f"{'' if laid else '; no pair from there'}")
-        if laid is None:
+        return laid
+
+    def routePairNudged(self, lead, follow, layers, winPads, viaMm=None):
+        """routePair's search once more, the designer's copper passable at a price; the
+        pieces the pair then runs into are nudged aside (Router.nudge). Tried once."""
+        if not self.k.nudge or lead.pairNudgeTried or lead.routed or follow.routed:
             return False
-        self.commitPair(lead, laid[0])
-        self.commitPair(follow, laid[1])
-        return True
+        lead.pairNudgeTried = follow.pairNudgeTried = True
+        self.movable = True
+        try:
+            laid = self.layPairEscaped(lead, follow, layers, winPads, viaMm)
+        finally:
+            self.movable = False
+        # the pieces this pair runs into, from its own items (the search tried several)
+        hits = {o.route for it in (laid[0] + laid[1] if laid else []) for o in self.check(it)}
+        if laid is None or not hits or len(hits) > self.k.nudgeMaxPieces or not all(self.nudgeable(r) for r in hits):
+            if os.environ.get("HR_TRACE_PAIR"):
+                self.log(f"pair {lead.net}/{follow.net}: movable search " + ("found no pair" if laid is None else
+                         f"would nudge {len(hits)} piece(s), {sum(self.nudgeable(r) for r in hits)} nudgeable"))
+            return False
+
+        def place():
+            if any(self.check(it) for it in laid[0] + laid[1]):
+                return None
+            self.commitPair(lead, laid[0])
+            self.commitPair(follow, laid[1])
+            return [lead.rid, follow.rid]
+        return self.nudge(hits, place, self.log)
 
     def findPair(self, lead, follow, layers, winPads, viaMm):
         """Both nets' items for a pair laid together, or None. When the cheapest
@@ -3343,7 +3600,8 @@ class Router:
             return "ok", None
         mate = conn.pairMate
         if mate is not None and not negotiate and not mate.routed and not self.connected(mate) \
-                and self.routePair(conn, mate, layers, winPads, viaMm):
+                and (self.routePair(conn, mate, layers, winPads, viaMm)
+                     or self.routePairNudged(conn, mate, layers, winPads, viaMm)):
             return "ok", self.routes[conn.rid]
         self.forbidVias = []
         for extra in (0.0, 0.03, 0.03):
@@ -3372,5 +3630,10 @@ class Router:
             fixedHit = [o for o in bad if o.kind not in ("track", "via") or (o.route < 0 and o.route not in soft)]
             if negotiate and victims and not fixedHit:
                 return "conflict", (res, items, victims)
+            if negotiate and self.k.nudge and fixedHit and all(o.kind in ("track", "via") for o in fixedHit):
+                pieces = {o.route for o in fixedHit}
+                if len(pieces) <= self.k.nudgeMaxPieces and all(self.nudgeable(r) for r in pieces) \
+                        and (conn.cid, frozenset(pieces)) not in self.nudgeRefused:
+                    return "nudge", (res, items, victims, pieces)
             # raster error against fixed copper: retry with a wider margin
         return "fail", None

@@ -1,0 +1,24 @@
+(version 1)
+
+# In1 (L2) is solid GND: the plane 0.21 mm under the top face, where the GNSS
+# patch, the LTE feed, the converters and the modem sit; it is the patch's
+# counterpoise and their return path, so nothing but GND routes on it.
+# In2 (L3) is GND poured around the hand-routed power runs (checkAmpacity.py
+# checks them at inner-layer copper weight); it references the bottom face,
+# which carries only the short GNSS RF_IN line and slow/medium signals.
+# Signals stay on the outer layers.
+(rule "In1: GND only"
+  (condition "A.Type == 'Track' && A.NetName != 'GND'")
+  (layer "In1.Cu")
+  (constraint disallow track))
+
+(rule "In2: GND and power only"
+  (condition "A.Type == 'Track' && A.NetName != 'GND' && A.NetName != 'SYS' && A.NetName != 'SYS_SW' && A.NetName != 'BAT' && A.NetName != 'V3V3' && A.NetName != 'VMDM' && A.NetName != 'VBUS' && A.NetName != 'CHG_IN' && A.NetName != 'V5_12'")
+  (layer "In2.Cu")
+  (constraint disallow track))
+
+# TI's DLH0010A land (BQ25185 charger) puts the exposed pad 0.1 mm from the signal
+# pads (4226298/A example board layout). That gap is the vendor's, inside one part.
+(rule "DLH0010A pad-to-EP gap"
+  (condition "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('U1') && B.memberOfFootprint('U1')")
+  (constraint clearance (min 0.09mm)))

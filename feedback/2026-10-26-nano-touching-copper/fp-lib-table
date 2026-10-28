@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "nano")(type "KiCad")(uri "${KIPRJMOD}/nano.pretty")(options "")(descr "GridCore Nano lands not in KiCad's stock library"))
+)

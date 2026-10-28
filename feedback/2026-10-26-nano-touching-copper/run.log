@@ -1,0 +1,47 @@
+./src/common/stdpbase.cpp(59): assert ""traits"" failed in Get(): create wxApp before calling this
+[    0.3s] model: 695 pads, 128 nets, 12 keepouts
+[    0.3s] planes: GND (whole board)
+[    0.3s] knob fanoutParts = none
+[    0.3s] knob stitch = False
+[    3.5s] space: 3561x2841 cells @ 0.025 mm
+10:12:19 PM: Debug: Adding duplicate image handler for 'PNG file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'JPEG file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'TIFF file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'GIF file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'PNM file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'PCX file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'IFF file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'Windows icon file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'Windows cursor file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'Windows animated cursor file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'TGA file'
+10:12:19 PM: Debug: Adding duplicate image handler for 'XPM file'
+[    4.9s] existing copper kept: 1040 tracks, 535 vias, 4 zones (1575 items; 0 drawn by an earlier run, which may be moved)
+[    5.0s] copper touching no pad of its net (kept; --drop-stale removes it): SYS at (36.90, 57.80): 1 tracks, 0 vias
+[    5.0s] plan: 467 connections, 23 blocks, 30 bundles, 2 differential pair links
+[    5.0s] routing 48 of 467 connections; the rest are left to you
+[    5.0s] 28 of them are already made by the copper on the board
+[    5.0s]   current: V3V3 U2->U4 0.50 A -> 0.30 mm
+[    5.4s] main diagonals: top \, bottom / (planned cost 86 vs 102 mm)
+[    6.0s] corridors: 2 groups, 15 rounds, 2 overfull tiles left, ~3 planned vias, 1/2 members mostly on bottom
+[    6.0s] pass 1: 48/48 routed in 1.0s, 0 failed: Counter(); 0 GND pads left to the pour
+[    6.0s] negotiation: 0 rounds, 0 unrouted: 
+[    6.1s] cleanup round 1: 1 routes improved of 5 candidates
+[    6.2s] cleanup round 2: 0 routes improved of 5 candidates
+[    6.3s] via cleanup: 5 -> 5 signal/power vias (0 hops undone by moving what they crossed)
+[    6.4s] straighten: 0 routes, 15 -> 15 corners
+[    6.4s] via tidying: 0 vias moved in line with their pads
+[    6.4s] corners: 0 right angles cut into two 45-degree bends
+[    6.4s] search stats: {'searches': 26, 'searchS': 0.06089700100000073, 'costS': 0.25555541499999634, 'commitS': 0.14857545700000063}
+[    6.4s] vias by kind: {'pwr': 0, 'sig': 0, 'pwr block cross/THT': 2, 'pwr bundle cross/THT': 1, 'pwr block same side': 2}
+[    6.4s] power copper: 0 tracks widened
+[    7.7s] wrote /private/tmp/claude-501/-Users-ivogeorgiev-linux-ivo-storage-repos-malaka-chrono/568faac8-a10e-4f69-84f9-6e300db2dce8/scratchpad/hwfix/r2/nano.kicad_pcb: 31 tracks, 5 vias
+[   19.7s] pads the pour does not reach: none
+[   19.7s] DRC: 0 violations {}, 0 unconnected
+[   19.8s] WARNING current path V5_12 L12 -> U14 (1.1 A, trunk 0.50 mm) runs through thinner copper: 2.55 mm at 0.3 mm on F.Cu near (32.6, 57.83), 0.82 mm at 0.3 mm on F.Cu near (33.5, 56.51)
+[   19.8s] WARNING current path BAT J_BAT -> U1 (2.6 A, trunk 0.80 mm) runs through thinner copper: 1.29 mm at 0.5 mm on F.Cu near (37.52, 59.39)
+[   19.8s] WARNING current path L2_MDM U11 -> L_MDM (2.6 A, trunk 0.80 mm) runs through thinner copper: 1.78 mm at 0.35 mm on F.Cu near (73.69, 7.07)
+[   19.8s] WARNING current path L1_3V3 U2 -> L_BUCK (0.8 A, trunk 0.50 mm) runs through thinner copper: 0.57 mm at 0.35 mm on F.Cu near (39.89, 65.55)
+[   19.8s] WARNING current path L2_3V3 U2 -> L_BUCK (0.8 A, trunk 0.50 mm) runs through thinner copper: 1.93 mm at 0.35 mm on F.Cu near (39.79, 66.75)
+[   19.8s] current paths: 5 of the flows squeezed
+[   19.8s] router copper recorded: 36 items in nano.humanrouter.json
