@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "wallet")(type "KiCad")(uri "${KIPRJMOD}/wallet.pretty")(options "")(descr "Ambire Ice lands not in KiCad's stock library"))
+)

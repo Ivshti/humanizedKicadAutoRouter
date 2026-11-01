@@ -1,0 +1,32 @@
+(version 1)
+
+# Stack-up: F.Cu / In1 / In2 / B.Cu. Every part sits on B.Cu, whose return
+# currents run in In2 -- so In2 is solid GND and nothing else routes on it.
+(rule "In2: GND only"
+  (condition "A.Type == 'Track' && A.NetName != 'GND'")
+  (layer "In2.Cu")
+  (constraint disallow track))
+
+# In1 is the 3.3 V plane, unbroken: the buses on the front copper return in it.
+(rule "In1: V3V3 plane"
+  (condition "A.Type == 'Track' && A.NetName != 'V3V3'")
+  (layer "In1.Cu")
+  (constraint disallow track))
+
+# Fine-pitch lands from the vendors' own drawings: the SE050's 0.4 mm HX2QFN and
+# the BQ25185's DLH0010A put pads closer than the board default.
+(rule "Fine-pitch lands"
+  (condition "A.Type == 'Pad' && B.Type == 'Pad' && (A.memberOfFootprint('U5') || A.memberOfFootprint('U1'))")
+  (constraint clearance (min 0.09mm)))
+
+# R_VSET's ground pad keeps its own tie via (stripGndTies KEEP); since the display
+# cutout grew (2026-10-31) the B.Cu pour reaches the pad with one spoke, not two.
+(rule "R_VSET.2: tied to its own via"
+  (condition "A.Type == 'Pad' && A.memberOfFootprint('R_VSET') && A.Pad_Number == '2'")
+  (constraint min_resolved_spokes 1))
+
+# The pack's steel spacers (magnet partners) carry no current; GND only keeps them from
+# floating. The B.Cu pour reaches each with one spoke, enough for that, and no tie via.
+(rule "Pack spacers: one spoke"
+  (condition "A.Type == 'Pad' && (A.memberOfFootprint('MH_PK1') || A.memberOfFootprint('MH_PK2'))")
+  (constraint min_resolved_spokes 1))
